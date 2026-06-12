@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PT-1 · Virtual Demo</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0D0C10; font-family: 'Inter', 'Helvetica Neue', sans-serif; }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: #111; }
+    ::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useCallback, useEffect } = React;
+
+// ─── Tokens ───────────────────────────────────────────────────────────────────
+const PINK       = "#E8187A";
+const PINK_DARK  = "#B01060";
+const PINK_GLOW  = "#FF40A0";
+const BODY_BG    = "#D01070";
+const BODY_SIDE  = "#A00858";
+const PANEL      = "#111014";
+const PANEL_HI   = "#1C1A20";
+const PANEL_EDGE = "#2A2730";
+const OLED_BG    = "#0A0A10";
+const WHITE      = "#F0ECE8";
+const DIM        = "#4A4655";
+const TEXT_SEC   = "#8A8495";
+
+const CAT = {
+  osc:    { color: "#6B7FD7", label: "OSC" },
+  filter: { color: "#5DB88A", label: "FILTER" },
+  env:    { color: "#C47E4A", label: "ENV" },
+  mod:    { color: "#9B6CC7", label: "MOD" },
+  fx:     { color: "#4FA8BF", label: "FX" },
+  macro:  { color: "#D4A84B", label: "MACRO" },
+};
+
+const BLOCKS = [
+  { id: "classic_osc",   cat: "osc",    label: "Classic Osc",    params: ["SAW","PULSE","TRI","SUB"],              icon: "∿", oscType: "sawtooth" },
+  { id: "wavetable_osc", cat: "osc",    label: "Wavetable Osc",  params: ["POSITION","WARP","SPREAD","LEVEL"],     icon: "∿", oscType: "sine"     },
+  { id: "fm_op",         cat: "osc",    label: "FM Operator",    params: ["RATIO","FEEDBACK","MOD IDX","LEVEL"],   icon: "∿", oscType: "sine"     },
+  { id: "sampler",       cat: "osc",    label: "Sampler",        params: ["START","END","LOOP","PITCH"],           icon: "▶", oscType: "square"   },
+  { id: "classic_vcf",   cat: "filter", label: "Classic VCF",    params: ["CUTOFF","RESONANCE","DRIVE","KEY TRK"],icon: "⊽" },
+  { id: "sv_filter",     cat: "filter", label: "State Variable", params: ["CUTOFF","RESONANCE","MORPH"],           icon: "⊽" },
+  { id: "amp_env",       cat: "env",    label: "Amp Env",        params: ["ATTACK","DECAY","SUSTAIN","RELEASE"],   icon: "⋀" },
+  { id: "filter_env",    cat: "env",    label: "Filter Env",     params: ["ATTACK","DECAY","SUSTAIN","RELEASE"],   icon: "⋀" },
+  { id: "lfo",           cat: "mod",    label: "LFO",            params: ["RATE","DEPTH","SHAPE","PHASE"],         icon: "~" },
+  { id: "random",        cat: "mod",    label: "Random",         params: ["RATE","SMOOTHING","DEPTH"],             icon: "?" },
+  { id: "delay",         cat: "fx",     label: "Delay",          params: ["TIME","FEEDBACK","MOD","MIX"],          icon: "◎" },
+  { id: "reverb",        cat: "fx",     label: "Reverb",         params: ["SIZE","DECAY","DAMPING","MIX"],         icon: "◎" },
+  { id: "chorus",        cat: "fx",     label: "Chorus",         params: ["RATE","DEPTH","WIDTH","MIX"],           icon: "◎" },
+];
+
+// ─── Piano Keys ───────────────────────────────────────────────────────────────
+const NOTE_PATTERN = [
+  { type:"white", note:"C",  semi:0  }, { type:"black", note:"C#", semi:1  },
+  { type:"white", note:"D",  semi:2  }, { type:"black", note:"D#", semi:3  },
+  { type:"white", note:"E",  semi:4  }, { type:"white", note:"F",  semi:5  },
+  { type:"black", note:"F#", semi:6  }, { type:"white", note:"G",  semi:7  },
+  { type:"black", note:"G#", semi:8  }, { type:"white", note:"A",  semi:9  },
+  { type:"black", note:"A#", semi:10 }, { type:"white", note:"B",  semi:11 },
+];
+function buildKeys() {
+  const keys = [];
+  for (let oct = 3; oct <= 5; oct++) {
+    NOTE_PATTERN.forEach(({ type, note, semi }) => {
+      const midi = (oct + 1) * 12 + semi;
+      const freq = 440 * Math.pow(2, (midi - 69) / 12);
+      keys.push({ type, note: `${note}${oct}`, freq, id: `${note}${oct}` });
+    });
+  }
+  return keys.slice(0, 30);
+}
+const KEYS = buildKeys();
+
+// ─── Audio Engine ─────────────────────────────────────────────────────────────
+function createEngine() {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const p = {
+    attack:0.008, decay:0.12, sustain:0.6, release:0.25,
+    cutoff:0.65, resonance:1.0, detune:0, lfoRate:2,
+    reverbMix:0.2, delayTime:0.35, delayFb:0.4,
+    drive:1.0, oscLevel:0.4,
+  };
+  const masterGain = ctx.createGain(); masterGain.gain.value = 0.7;
+  masterGain.connect(ctx.destination);
+  const filter = ctx.createBiquadFilter();
+  filter.type = "lowpass";
+  filter.frequency.value = 100 * Math.pow(180, p.cutoff);
+  filter.Q.value = p.resonance;
+  const convolver = ctx.createConvolver();
+  const reverbGain = ctx.createGain(); reverbGain.gain.value = 0.2;
+  const dryGain    = ctx.createGain(); dryGain.gain.value    = 0.8;
+  const irLen = ctx.sampleRate * 2.5;
+  const ir = ctx.createBuffer(2, irLen, ctx.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = ir.getChannelData(ch);
+    for (let i = 0; i < irLen; i++) d[i] = (Math.random()*2-1)*Math.pow(1-i/irLen,2.5);
+  }
+  convolver.buffer = ir;
+  const delayNode    = ctx.createDelay(2.0); delayNode.delayTime.value = p.delayTime;
+  const delayFbGain  = ctx.createGain();     delayFbGain.gain.value    = p.delayFb;
+  const delayMixGain = ctx.createGain();     delayMixGain.gain.value   = 0;
+  filter.connect(dryGain);
+  filter.connect(convolver); convolver.connect(reverbGain);
+  filter.connect(delayMixGain); delayMixGain.connect(delayNode);
+  delayNode.connect(delayFbGain); delayFbGain.connect(delayNode);
+  delayNode.connect(masterGain);
+  dryGain.connect(masterGain); reverbGain.connect(masterGain);
+  const lfo = ctx.createOscillator(); lfo.type = "sine";
+  lfo.frequency.value = p.lfoRate;
+  const lfoGain = ctx.createGain(); lfoGain.gain.value = 0;
+  lfo.connect(lfoGain); lfo.start();
+  // Per-oscillator mix levels for Classic Osc
+  const mix = { saw: 0.5, pulse: 0.0, tri: 0.0, sub: 0.0 };
+
+  const activeNotes = {};
+  function noteOn(freq, oscType = "sawtooth") {
+    if (ctx.state === "suspended") ctx.resume();
+    if (activeNotes[freq]) noteOff(freq);
+
+    const envGain = ctx.createGain();
+    envGain.connect(filter);
+    const noteData = { envGain, oscs: [] };
+
+    if (oscType === "classic") {
+      // Four separate oscillators, each with its own gain
+      const defs = [
+        { type:"sawtooth", gainVal: mix.saw  },
+        { type:"square",   gainVal: mix.pulse },
+        { type:"triangle", gainVal: mix.tri   },
+        { type:"sawtooth", gainVal: mix.sub, detuneSemis: -12 }, // sub oct
+      ];
+      defs.forEach(def => {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type = def.type;
+        o.frequency.value = freq;
+        o.detune.value = (def.detuneSemis || 0) * 100 + p.detune * 100;
+        g.gain.value = def.gainVal * p.drive;
+        lfoGain.connect(o.frequency);
+        o.connect(g); g.connect(envGain);
+        o.start(); 
+        noteData.oscs.push({ osc: o, gainNode: g, role: def.detuneSemis ? "sub" : def.type });
+      });
+    } else {
+      const osc = ctx.createOscillator();
+      osc.type = oscType; osc.frequency.value = freq;
+      osc.detune.value = p.detune * 100;
+      const g = ctx.createGain(); g.gain.value = 0.4 * p.drive;
+      lfoGain.connect(osc.frequency);
+      osc.connect(g); g.connect(envGain);
+      osc.start();
+      noteData.oscs.push({ osc, gainNode: g, role: oscType });
+    }
+
+    const atk = Math.max(0.001, p.attack);
+    const dec = Math.max(0.01,  p.decay);
+    const sus = Math.max(0.001, p.sustain);
+    const now = ctx.currentTime;
+    envGain.gain.setValueAtTime(0, now);
+    envGain.gain.linearRampToValueAtTime(1.0,       now + atk);
+    envGain.gain.linearRampToValueAtTime(sus,        now + atk + dec);
+    filter.frequency.value = 100 * Math.pow(180, p.cutoff);
+    filter.Q.value = Math.max(0.1, p.resonance * 10);
+    activeNotes[freq] = noteData;
+  }
+
+  function noteOff(freq) {
+    const note = activeNotes[freq]; if (!note) return;
+    const rel = Math.max(0.01, p.release);
+    const now = ctx.currentTime;
+    note.envGain.gain.cancelScheduledValues(now);
+    note.envGain.gain.setValueAtTime(note.envGain.gain.value, now);
+    note.envGain.gain.linearRampToValueAtTime(0, now + rel);
+    const stopAt = now + rel + 0.01;
+    note.oscs.forEach(({ osc }) => osc.stop(stopAt));
+    delete activeNotes[freq];
+  }
+
+  // Live-update mix gains on all active notes
+  function updateMixGains() {
+    Object.values(activeNotes).forEach(note => {
+      note.oscs.forEach(({ gainNode, role }) => {
+        const v = role === "sawtooth" ? mix.saw
+                : role === "square"   ? mix.pulse
+                : role === "triangle" ? mix.tri
+                : role === "sub"      ? mix.sub : 0.4;
+        gainNode.gain.setTargetAtTime(v * p.drive, ctx.currentTime, 0.02);
+      });
+    });
+  }
+
+  const setters = {
+    ATTACK:       v => { p.attack    = 0.001 + v * 3.0; },
+    DECAY:        v => { p.decay     = 0.01  + v * 2.0; },
+    SUSTAIN:      v => { p.sustain   = v; },
+    RELEASE:      v => { p.release   = 0.01  + v * 4.0; },
+    CUTOFF:       v => { p.cutoff    = v; filter.frequency.value = 100 * Math.pow(180, v); },
+    RESONANCE:    v => { p.resonance = v; filter.Q.value = Math.max(0.1, v * 20); },
+    MORPH:        v => { p.cutoff    = v; filter.frequency.value = 100 * Math.pow(180, v); },
+    DRIVE:        v => { p.drive     = 0.2 + v * 3; updateMixGains(); },
+    "KEY TRK":    v => {},
+    SAW:          v => { mix.saw   = v; updateMixGains(); },
+    PULSE:        v => { mix.pulse = v; updateMixGains(); },
+    TRI:          v => { mix.tri   = v; updateMixGains(); },
+    SUB:          v => { mix.sub   = v * 0.7; updateMixGains(); },
+    LEVEL:        v => { p.oscLevel = 0.1 + v * 0.5; },
+    POSITION:     v => {},
+    WARP:         v => {},
+    SPREAD:       v => {},
+    PITCH:        v => { p.detune    = (v - 0.5) * 24; },
+    RATIO:        v => { p.detune    = (v - 0.5) * 24; },
+    "MOD IDX":    v => { if (lfoGain.gain.value > 0) lfoGain.gain.value = v * 80; },
+    START:        v => {},
+    END:          v => {},
+    LOOP:         v => {},
+    FEEDBACK:     v => { p.delayFb   = v * 0.92; delayFbGain.gain.setTargetAtTime(p.delayFb, ctx.currentTime, 0.05); },
+    RATE:         v => { p.lfoRate   = 0.05 + v * 19.95; lfo.frequency.value = p.lfoRate; },
+    DEPTH:        v => { lfoGain.gain.value = v * 80; },
+    SHAPE:        v => { lfo.type    = ["sine","triangle","sawtooth","square"][Math.floor(v*3.99)]; },
+    PHASE:        v => {},
+    SMOOTHING:    v => {},
+    TIME:         v => { p.delayTime = 0.05 + v * 1.5; delayNode.delayTime.setTargetAtTime(p.delayTime, ctx.currentTime, 0.05); },
+    MOD:          v => { lfoGain.gain.value = v * 40; },
+    MIX:          v => { delayMixGain.gain.setTargetAtTime(v*0.7, ctx.currentTime, 0.05); reverbGain.gain.setTargetAtTime(v*0.5, ctx.currentTime, 0.05); },
+    SIZE:         v => { reverbGain.gain.setTargetAtTime(v * 0.6, ctx.currentTime, 0.05); },
+    DAMPING:      v => { filter.frequency.value = 2000 + v * 16000; },
+    WIDTH:        v => { lfoGain.gain.value = v * 20; },
+    "ENV AMT":    v => { p.sustain   = v; },
+    "LFO RATE":   v => { p.lfoRate   = 0.05 + v * 19.95; lfo.frequency.value = p.lfoRate; },
+    "DELAY TIME": v => { p.delayTime = 0.05 + v * 1.5; delayNode.delayTime.setTargetAtTime(p.delayTime, ctx.currentTime, 0.05); },
+    REVERB:       v => { reverbGain.gain.setTargetAtTime(v * 0.6, ctx.currentTime, 0.05); },
+    VOLUME:       v => { masterGain.gain.setTargetAtTime(0.1 + v * 0.9, ctx.currentTime, 0.02); },
+  };
+  function enableDelay(on) { delayMixGain.gain.setTargetAtTime(on ? 0.4 : 0, ctx.currentTime, 0.05); }
+  function enableLfo(on)   { lfoGain.gain.value = on ? 30 : 0; }
+  function setParam(label, val) { const fn = setters[label]; if (fn) fn(val); }
+  return { ctx, noteOn, noteOff, setParam, enableDelay, enableLfo };
+}
+
+// ─── OledLabel ────────────────────────────────────────────────────────────────
+function OledLabel({ text, color, active }) {
+  return (
+    <div style={{ background:OLED_BG, border:`1px solid ${active?color:"#222"}`, borderRadius:3, padding:"2px 3px", minWidth:40, textAlign:"center", transition:"border-color 0.3s,box-shadow 0.3s", boxShadow:active?`0 0 6px ${color}77`:"none" }}>
+      <span style={{ fontFamily:"'Courier New',monospace", fontSize:8, fontWeight:700, letterSpacing:"0.05em", color:active?color:DIM, transition:"color 0.3s", display:"block", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+        {text || "——"}
+      </span>
+    </div>
+  );
+}
+
+// ─── Slider ───────────────────────────────────────────────────────────────────
+function Slider({ slotId, label, color, value, assigned, highlighted, onDrop, dragOver, setDragOver, onChange }) {
+  const trackH = 80;
+  const trackRef = useRef();
+  const dragging = useRef(false);
+  const valueFromY = clientY => {
+    const r = trackRef.current.getBoundingClientRect();
+    return Math.max(0, Math.min(1, 1 - (clientY - r.top) / r.height));
+  };
+  const onMouseDown = e => {
+    if (!assigned) return; e.preventDefault(); dragging.current = true;
+    onChange(slotId, valueFromY(e.clientY));
+    const mv = e2 => { if (dragging.current) onChange(slotId, valueFromY(e2.clientY)); };
+    const up = () => { dragging.current = false; window.removeEventListener("mousemove",mv); window.removeEventListener("mouseup",up); };
+    window.addEventListener("mousemove",mv); window.addEventListener("mouseup",up);
+  };
+  const onTouchStart = e => { if (!assigned) return; e.preventDefault(); onChange(slotId, valueFromY(e.touches[0].clientY)); };
+  const onTouchMove  = e => { if (!assigned) return; e.preventDefault(); onChange(slotId, valueFromY(e.touches[0].clientY)); };
+  const thumbY = (1 - value) * (trackH - 14);
+  const isHov  = dragOver === slotId;
+  const bc = isHov ? color : (highlighted ? color+"88" : PANEL_EDGE);
+  const sh = isHov ? `0 0 10px ${color}88` : (highlighted ? `0 0 6px ${color}44` : "none");
+  return (
+    <div style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:4,width:28 }}
+      onDragOver={e=>{e.preventDefault();setDragOver(slotId);}}
+      onDragLeave={()=>setDragOver(null)}
+      onDrop={e=>{e.preventDefault();setDragOver(null);onDrop(slotId,"slider");}}>
+      <div ref={trackRef} onMouseDown={onMouseDown} onTouchStart={onTouchStart} onTouchMove={onTouchMove}
+        style={{ width:12,height:trackH,background:"#0C0B10",borderRadius:6,position:"relative",border:`1px solid ${bc}`,boxShadow:sh,transition:"border-color 0.2s,box-shadow 0.2s",cursor:assigned?"ns-resize":"default",touchAction:"none" }}>
+        <div style={{ position:"absolute",bottom:0,left:2,right:2,height:`${value*100}%`,background:assigned?color+"44":"#1A1820",borderRadius:"0 0 4px 4px",transition:"background 0.3s" }}/>
+        <div style={{ position:"absolute",left:-3,top:thumbY,width:18,height:14,background:assigned?`linear-gradient(180deg,${color},${color}BB)`:"linear-gradient(180deg,#555,#333)",borderRadius:3,boxShadow:assigned?`0 0 6px ${color}66`:"0 1px 3px #000",transition:"background 0.3s,box-shadow 0.3s" }}/>
+      </div>
+      <span style={{ fontSize:8,color:assigned?color:DIM,fontFamily:"monospace" }}>{Math.round(value*100)}</span>
+      <OledLabel text={label} color={color} active={!!assigned}/>
+    </div>
+  );
+}
+
+// ─── Encoder ──────────────────────────────────────────────────────────────────
+function Encoder({ slotId, label, color, value, assigned, highlighted, onDrop, dragOver, setDragOver, onChange }) {
+  const size = 34; const cx = size/2; const r = cx-5;
+  const startRef = useRef(null);
+  const isHov = dragOver === `enc-${slotId}`;
+  const angle = -135 + value * 270;
+  const rad   = angle * Math.PI / 180;
+  const dotX  = cx + r * Math.sin(rad);
+  const dotY  = cx - r * Math.cos(rad);
+  const vFromDelta = (sv, sy, cy2) => Math.max(0, Math.min(1, sv + (sy - cy2) / 120));
+  const onMouseDown = e => {
+    if (!assigned) return; e.preventDefault();
+    startRef.current = { y:e.clientY, value };
+    const mv = e2 => { if (startRef.current) onChange(slotId, vFromDelta(startRef.current.value, startRef.current.y, e2.clientY)); };
+    const up = () => { startRef.current=null; window.removeEventListener("mousemove",mv); window.removeEventListener("mouseup",up); };
+    window.addEventListener("mousemove",mv); window.addEventListener("mouseup",up);
+  };
+  const onTouchStart = e => { if (!assigned) return; e.preventDefault(); startRef.current = { y:e.touches[0].clientY, value }; };
+  const onTouchMove  = e => { if (!assigned||!startRef.current) return; e.preventDefault(); onChange(slotId, vFromDelta(startRef.current.value, startRef.current.y, e.touches[0].clientY)); };
+  const onTouchEnd   = () => { startRef.current = null; };
+  const bc = isHov ? color : (highlighted ? color+"88" : "#333");
+  return (
+    <div style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:3 }}
+      onDragOver={e=>{e.preventDefault();setDragOver(`enc-${slotId}`);}}
+      onDragLeave={()=>setDragOver(null)}
+      onDrop={e=>{e.preventDefault();setDragOver(null);onDrop(slotId,"encoder");}}>
+      <svg width={size} height={size}
+        style={{ cursor:assigned?"ns-resize":"default", filter:(isHov||highlighted)?`drop-shadow(0 0 4px ${color}88)`:"none", transition:"filter 0.2s", touchAction:"none" }}
+        onMouseDown={onMouseDown} onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
+        <defs>
+          <radialGradient id={`eg${slotId}`} cx="35%" cy="30%" r="70%">
+            <stop offset="0%" stopColor="#444"/><stop offset="100%" stopColor="#111"/>
+          </radialGradient>
+        </defs>
+        <circle cx={cx} cy={cx} r={cx-1} fill={`url(#eg${slotId})`} stroke={bc} strokeWidth="1.5"/>
+        <circle cx={cx} cy={cx} r={r} fill="none" stroke="#222" strokeWidth="2"/>
+        {assigned && <circle cx={dotX} cy={dotY} r="2.5" fill={color} style={{filter:`drop-shadow(0 0 3px ${color})`}}/>}
+        <circle cx={cx} cy={cx} r="3" fill={assigned?color+"44":"#222"} stroke={assigned?color:"#333"} strokeWidth="1"/>
+      </svg>
+      <OledLabel text={label} color={color||DIM} active={!!assigned}/>
+    </div>
+  );
+}
+
+// ─── Piano ────────────────────────────────────────────────────────────────────
+function PianoKey({ keyDef, onNoteOn, onNoteOff, active }) {
+  const w = keyDef.type === "white";
+  return (
+    <div
+      style={w ? {
+        width:18,height:80,flexShrink:0,zIndex:0,
+        background:active?`linear-gradient(180deg,${PINK}CC,${PINK}88)`:"linear-gradient(180deg,#F5F0EB,#DDD8D0)",
+        border:"1px solid #999",borderRadius:"0 0 3px 3px",
+        boxShadow:active?`0 0 10px ${PINK}`:"inset -1px 0 0 #CCC,0 3px 4px #0008",
+        cursor:"pointer",transition:"background 0.05s,box-shadow 0.1s",
+      } : {
+        width:12,height:50,flexShrink:0,zIndex:1,marginLeft:-6,marginRight:-6,
+        background:active?`linear-gradient(180deg,${PINK},${PINK_DARK})`:"linear-gradient(180deg,#111,#000)",
+        border:"1px solid #333",borderRadius:"0 0 2px 2px",
+        boxShadow:active?`0 0 10px ${PINK}`:"0 3px 4px #000A,inset 1px 0 0 #222",
+        cursor:"pointer",transition:"background 0.05s,box-shadow 0.1s",
+      }}
+      onMouseDown={e=>{e.preventDefault();onNoteOn(keyDef.freq);}}
+      onMouseUp={()=>onNoteOff(keyDef.freq)}
+      onMouseLeave={()=>onNoteOff(keyDef.freq)}
+      onTouchStart={e=>{e.preventDefault();onNoteOn(keyDef.freq);}}
+      onTouchEnd={()=>onNoteOff(keyDef.freq)}
+    />
+  );
+}
+function Piano({ onNoteOn, onNoteOff, activeFreqs }) {
+  return (
+    <div style={{ width:"100%", background:"#1A1720",borderRadius:"0 0 10px 10px",padding:"6px 8px 10px",border:"1px solid #333",boxShadow:"inset 0 3px 8px #0006",overflowX:"auto",display:"flex",alignItems:"flex-start",justifyContent:"center" }}>
+      <div style={{ display:"flex", alignItems:"flex-start" }}>
+        {KEYS.map(k=><PianoKey key={k.id} keyDef={k} onNoteOn={onNoteOn} onNoteOff={onNoteOff} active={activeFreqs.has(k.freq)}/>)}
+      </div>
+    </div>
+  );
+}
+
+// ─── Block Card ───────────────────────────────────────────────────────────────
+function BlockCard({ block, onDragStart, isDragging }) {
+  const color = CAT[block.cat].color;
+  return (
+    <div draggable
+      onDragStart={e=>{e.dataTransfer.setData("blockId",block.id);onDragStart(block);}}
+      onDragEnd={()=>onDragStart(null)}
+      style={{ background:isDragging?color+"22":PANEL_HI, border:`1px solid ${isDragging?color:PANEL_EDGE}`, borderLeft:`3px solid ${color}`, borderRadius:5, padding:"8px 10px", cursor:"grab", userSelect:"none", transition:"all 0.15s", opacity:isDragging?0.5:1 }}>
+      <div style={{ display:"flex",alignItems:"center",gap:6,marginBottom:4 }}>
+        <span style={{ fontSize:14,color }}>{block.icon}</span>
+        <span style={{ fontSize:11,fontWeight:700,color:WHITE,letterSpacing:"0.02em" }}>{block.label}</span>
+        <span style={{ marginLeft:"auto",fontSize:9,fontWeight:700,color,background:color+"22",padding:"1px 5px",borderRadius:3 }}>{CAT[block.cat].label}</span>
+      </div>
+      <div style={{ display:"flex",gap:4,flexWrap:"wrap" }}>
+        {block.params.slice(0,4).map(p=><span key={p} style={{ fontSize:8,color:TEXT_SEC,background:"#0006",padding:"1px 4px",borderRadius:2 }}>{p}</span>)}
+      </div>
+      <div style={{ marginTop:5,fontSize:9,color:DIM,fontStyle:"italic" }}>drag to sliders or encoders →</div>
+    </div>
+  );
+}
+
+// ─── Joystick ─────────────────────────────────────────────────────────────────
+function Joystick() {
+  const [pos,setPos]=useState({x:0,y:0}); const ref=useRef(); const drag=useRef(false);
+  return (
+    <div ref={ref} style={{ width:64,height:64,borderRadius:"50%",background:"radial-gradient(circle at 40% 35%,#333,#111)",border:"3px solid #2A2730",boxShadow:"0 4px 12px #0009,inset 0 1px 0 #444",display:"flex",alignItems:"center",justifyContent:"center",cursor:"crosshair",position:"relative",userSelect:"none" }}
+      onMouseDown={()=>{drag.current=true;}}
+      onMouseUp={()=>{drag.current=false;setPos({x:0,y:0});}}
+      onMouseLeave={()=>{drag.current=false;setPos({x:0,y:0});}}
+      onMouseMove={e=>{if(!drag.current||!ref.current)return;const r=ref.current.getBoundingClientRect();setPos({x:Math.max(-1,Math.min(1,(e.clientX-(r.left+r.width/2))/30)),y:Math.max(-1,Math.min(1,(e.clientY-(r.top+r.height/2))/30))});}}>
+      <div style={{ position:"absolute",width:1,height:"60%",background:"#333",top:"20%" }}/>
+      <div style={{ position:"absolute",height:1,width:"60%",background:"#333",left:"20%" }}/>
+      <div style={{ width:22,height:22,borderRadius:"50%",background:`radial-gradient(circle at 35% 30%,${PINK_GLOW},${PINK_DARK})`,boxShadow:`0 0 10px ${PINK}88`,transform:`translate(${pos.x*14}px,${pos.y*14}px)`,transition:drag.current?"none":"transform 0.2s cubic-bezier(.22,.61,.36,1)" }}/>
+    </div>
+  );
+}
+
+// ─── Touch Strip ──────────────────────────────────────────────────────────────
+function TouchStrip() {
+  const [pos,setPos]=useState(0.5); const ref=useRef();
+  const handle=cx=>{if(!ref.current)return;const r=ref.current.getBoundingClientRect();setPos(Math.max(0,Math.min(1,(cx-r.left)/r.width)));};
+  return (
+    <div ref={ref} style={{ height:16,borderRadius:8,background:"#0A0A10",border:`1px solid ${PANEL_EDGE}`,position:"relative",cursor:"ew-resize",boxShadow:"inset 0 1px 4px #000",touchAction:"none" }}
+      onMouseMove={e=>e.buttons&&handle(e.clientX)} onClick={e=>handle(e.clientX)}
+      onTouchStart={e=>{e.preventDefault();handle(e.touches[0].clientX);}}
+      onTouchMove={e=>{e.preventDefault();handle(e.touches[0].clientX);}}>
+      <div style={{ position:"absolute",left:0,top:2,bottom:2,width:`${pos*100}%`,minWidth:16,background:`linear-gradient(90deg,${PINK}33,${PINK})`,borderRadius:6 }}/>
+      <div style={{ position:"absolute",top:"50%",transform:"translateY(-50%)",left:`calc(${pos*100}% - 6px)`,width:12,height:12,borderRadius:"50%",background:PINK,boxShadow:`0 0 8px ${PINK}` }}/>
+    </div>
+  );
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+function App() {
+  const engineRef = useRef(null);
+  const [engineReady,setEngineReady] = useState(false);
+  const [activeFreqs,setActiveFreqs] = useState(new Set());
+  const [slots,setSlots]   = useState(Array.from({length:16},()=>({label:null,color:null,value:0.3+Math.random()*0.4})));
+  const [encoders,setEncoders] = useState(
+    ["CUTOFF","RESONANCE","ENV AMT","LFO RATE","DRIVE","REVERB","DELAY TIME","VOLUME"]
+    .map(label=>({label,color:null,value:0.3+Math.random()*0.4,assigned:false,defaultLabel:label}))
+  );
+  const [dragBlock,setDragBlock] = useState(null);
+  const [dragOver,setDragOver]   = useState(null);
+  const [activeBlocks,setActiveBlocks] = useState([]);
+  const [catFilter,setCatFilter] = useState("all");
+
+  const previewSlots    = dragBlock && dragOver !== null && typeof dragOver === "number"
+    ? Array.from({length:dragBlock.params.length},(_,i)=>dragOver+i).filter(i=>i<16) : [];
+  const previewEncoders = dragBlock && typeof dragOver === "string" && dragOver.startsWith("enc-")
+    ? (() => { const s=parseInt(dragOver.split("-")[1]); return Array.from({length:dragBlock.params.length},(_,i)=>s+i).filter(i=>i<8); })() : [];
+
+  const getEngine = useCallback(()=>{
+    if (!engineRef.current) { engineRef.current=createEngine(); setEngineReady(true); }
+    return engineRef.current;
+  },[]);
+
+  const currentOscType = useCallback(()=>{
+    const b = activeBlocks.find(b=>b.cat==="osc");
+    if (!b) return "sawtooth";
+    if (b.id === "classic_osc") return "classic";
+    return b.oscType || "sawtooth";
+  },[activeBlocks]);
+
+  const noteOn = useCallback(freq=>{
+    const eng=getEngine(); eng.noteOn(freq,currentOscType());
+    setActiveFreqs(prev=>new Set([...prev,freq]));
+  },[getEngine,currentOscType]);
+
+  const noteOff = useCallback(freq=>{
+    if(!engineRef.current)return;
+    engineRef.current.noteOff(freq);
+    setActiveFreqs(prev=>{const s=new Set(prev);s.delete(freq);return s;});
+  },[]);
+
+  useEffect(()=>{
+    if(!engineRef.current)return;
+    const eng=engineRef.current;
+    eng.enableDelay(activeBlocks.some(b=>b.id==="delay"));
+    eng.enableLfo(activeBlocks.some(b=>b.cat==="mod"));
+    if(activeBlocks.some(b=>b.cat==="filter")) eng.setParam("CUTOFF",0.55);
+  },[activeBlocks]);
+
+  const handleDrop = useCallback((slotId,target)=>{
+    if(!dragBlock)return;
+    const color=CAT[dragBlock.cat].color; const params=dragBlock.params;
+    if(target==="slider"){
+      setSlots(prev=>{const n=[...prev];for(let i=0;i<params.length&&slotId+i<16;i++)n[slotId+i]={...n[slotId+i],label:params[i],color,blockId:dragBlock.id};return n;});
+    } else {
+      setEncoders(prev=>{const n=[...prev];for(let i=0;i<params.length&&slotId+i<8;i++)n[slotId+i]={...n[slotId+i],label:params[i],color,assigned:true,blockId:dragBlock.id};return n;});
+    }
+    if(!activeBlocks.find(b=>b.id===dragBlock.id)) setActiveBlocks(prev=>[...prev,dragBlock]);
+    setDragBlock(null);
+  },[dragBlock,activeBlocks]);
+
+  const handleSliderChange = useCallback((slotId,val)=>{
+    setSlots(prev=>{const n=[...prev];const label=n[slotId].label;n[slotId]={...n[slotId],value:val};if(label&&engineRef.current)engineRef.current.setParam(label,val);return n;});
+  },[]);
+
+  const handleEncoderChange = useCallback((slotId,val)=>{
+    setEncoders(prev=>{const n=[...prev];const label=n[slotId].label;n[slotId]={...n[slotId],value:val};if(engineRef.current)engineRef.current.setParam(label,val);return n;});
+  },[]);
+
+  const filteredBlocks = catFilter==="all"?BLOCKS:BLOCKS.filter(b=>b.cat===catFilter);
+  const cats = ["all","osc","filter","env","mod","fx"];
+  const clearAll = ()=>{
+    setSlots(Array.from({length:16},()=>({label:null,color:null,value:0.3+Math.random()*0.4})));
+    setEncoders(["CUTOFF","RESONANCE","ENV AMT","LFO RATE","DRIVE","REVERB","DELAY TIME","VOLUME"].map(label=>({label,color:null,value:0.3+Math.random()*0.4,assigned:false,defaultLabel:label})));
+    setActiveBlocks([]);
+  };
+
+  return (
+    <div style={{ fontFamily:"'Inter','Helvetica Neue',sans-serif",background:"#0D0C10",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",padding:"24px 16px 40px",gap:24 }}>
+
+      <div style={{ textAlign:"center" }}>
+        <div style={{ fontSize:11,color:PINK,fontWeight:700,letterSpacing:"0.2em",textTransform:"uppercase",marginBottom:4 }}>PT-1 · Virtual Demo</div>
+        <div style={{ fontSize:13,color:TEXT_SEC }}>{engineReady?"Play the keys · Drag blocks onto sliders or encoders":"Press a key to start audio · Drag blocks onto sliders or encoders"}</div>
+      </div>
+
+      <div style={{ background:`linear-gradient(160deg,${BODY_BG},${PINK_DARK})`,borderRadius:16,padding:"3px",boxShadow:`0 0 0 1px ${BODY_SIDE},0 20px 60px #000C,0 0 40px ${PINK}22`,maxWidth:940,width:"100%" }}>
+        <div style={{ background:`linear-gradient(160deg,${BODY_BG},#B01060)`,borderRadius:14,padding:"16px 16px 0",boxShadow:"inset 0 1px 0 #FF80C088" }}>
+
+          <div style={{ background:PANEL,borderRadius:"10px 10px 0 0",padding:"12px 14px",display:"flex",gap:12,alignItems:"flex-start" }}>
+
+            {/* Encoders */}
+            <div style={{ display:"flex",flexDirection:"column",gap:6 }}>
+              <div style={{ fontSize:8,color:dragBlock?PINK:DIM,letterSpacing:"0.1em",textTransform:"uppercase",textAlign:"center",transition:"color 0.2s" }}>ENCODERS {dragBlock&&"· drop here"}</div>
+              <div style={{ display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6 }}>
+                {encoders.map((enc,i)=>(
+                  <Encoder key={i} slotId={i} label={enc.assigned?enc.label:enc.defaultLabel} color={enc.color||DIM} value={enc.value} assigned={enc.assigned} highlighted={previewEncoders.includes(i)} onDrop={handleDrop} dragOver={dragOver} setDragOver={setDragOver} onChange={handleEncoderChange}/>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ width:1,background:PANEL_EDGE,alignSelf:"stretch",margin:"0 4px" }}/>
+
+            {/* Sliders */}
+            <div style={{ flex:1 }}>
+              <div style={{ fontSize:8,color:dragBlock?PINK:DIM,letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:8,textAlign:"center",transition:"color 0.2s" }}>SLIDERS {dragBlock?"· drop here":"· drag blocks here"}</div>
+              <div style={{ display:"flex",gap:5,justifyContent:"center" }}>
+                {slots.map((slot,i)=>(
+                  <Slider key={i} slotId={i} label={slot.label} color={slot.color||DIM} value={slot.value} assigned={!!slot.label} highlighted={previewSlots.includes(i)} onDrop={handleDrop} dragOver={dragOver} setDragOver={setDragOver} onChange={handleSliderChange}/>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ width:1,background:PANEL_EDGE,alignSelf:"stretch",margin:"0 4px" }}/>
+
+            {/* Joystick */}
+            <div style={{ display:"flex",flexDirection:"column",gap:10,alignItems:"center",minWidth:80 }}>
+              <div style={{ fontSize:8,color:DIM,letterSpacing:"0.1em",textTransform:"uppercase" }}>JOYSTICK</div>
+              <Joystick/>
+              <div style={{ fontSize:8,color:DIM,textAlign:"center" }}>PUSH = ASSIGN</div>
+            </div>
+          </div>
+
+          <div style={{ background:PANEL,padding:"6px 14px 8px",borderTop:`1px solid ${PANEL_EDGE}` }}>
+            <div style={{ fontSize:8,color:DIM,letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:4 }}>TOUCH STRIP</div>
+            <TouchStrip/>
+          </div>
+
+          {activeBlocks.length > 0 && (
+            <div style={{ background:"#0A0910",borderTop:`1px solid ${PANEL_EDGE}`,padding:"6px 14px",display:"flex",gap:6,alignItems:"center",flexWrap:"wrap" }}>
+              <span style={{ fontSize:9,color:DIM,letterSpacing:"0.1em",textTransform:"uppercase",marginRight:4 }}>CHAIN</span>
+              {activeBlocks.map((b,i)=>{const color=CAT[b.cat].color;return(
+                <span key={b.id} style={{ display:"flex",alignItems:"center",gap:4 }}>
+                  <span style={{ fontSize:9,fontWeight:700,color,background:color+"18",border:`1px solid ${color}44`,padding:"2px 8px",borderRadius:3 }}>{b.label}</span>
+                  {i<activeBlocks.length-1&&<span style={{ color:DIM,fontSize:10 }}>→</span>}
+                </span>
+              );})}
+              <button onClick={clearAll} style={{ marginLeft:"auto",fontSize:9,color:DIM,background:"none",border:`1px solid ${PANEL_EDGE}`,borderRadius:3,padding:"2px 8px",cursor:"pointer" }}>CLEAR</button>
+            </div>
+          )}
+
+          <Piano onNoteOn={noteOn} onNoteOff={noteOff} activeFreqs={activeFreqs}/>
+        </div>
+      </div>
+
+      <div style={{ maxWidth:940,width:"100%" }}>
+        <div style={{ display:"flex",alignItems:"center",gap:12,marginBottom:12 }}>
+          <span style={{ fontSize:11,fontWeight:700,color:WHITE,letterSpacing:"0.1em",textTransform:"uppercase" }}>Block Library</span>
+          <div style={{ display:"flex",gap:4 }}>
+            {cats.map(c=>(
+              <button key={c} onClick={()=>setCatFilter(c)} style={{ padding:"4px 10px",borderRadius:4,border:"none",cursor:"pointer",fontSize:10,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",background:catFilter===c?(c==="all"?PINK:CAT[c]?.color):PANEL_HI,color:catFilter===c?"#000":TEXT_SEC,transition:"all 0.15s" }}>
+                {c==="all"?"ALL":CAT[c].label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:8 }}>
+          {filteredBlocks.map(b=><BlockCard key={b.id} block={b} onDragStart={setDragBlock} isDragging={dragBlock?.id===b.id}/>)}
+        </div>
+        <div style={{ marginTop:16,fontSize:11,color:DIM,textAlign:"center" }}>
+          Drop onto sliders for fader control · Drop onto encoders for rotary control · Highlighted controls show where params will land
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
