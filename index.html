@@ -48,15 +48,22 @@ const BLOCKS = [
   { id: "wavetable_osc", cat: "osc",    label: "Wavetable Osc",  params: ["POSITION","WARP","SPREAD","LEVEL"],     icon: "∿", oscType: "sine"     },
   { id: "fm_op",         cat: "osc",    label: "FM Operator",    params: ["RATIO","FEEDBACK","MOD IDX","LEVEL"],   icon: "∿", oscType: "sine"     },
   { id: "sampler",       cat: "osc",    label: "Sampler",        params: ["START","END","LOOP","PITCH"],           icon: "▶", oscType: "square"   },
-  { id: "classic_vcf",   cat: "filter", label: "Classic VCF",    params: ["CUTOFF","RESONANCE","DRIVE","KEY TRK"],icon: "⊽" },
-  { id: "sv_filter",     cat: "filter", label: "State Variable", params: ["CUTOFF","RESONANCE","MORPH"],           icon: "⊽" },
+
+  // ── Four iconic filter types ──────────────────────────────────────────────
+  { id: "moog_ladder",   cat: "filter", label: "Moog Ladder",    params: ["CUTOFF","RESONANCE","DRIVE","KEY TRK"], icon: "⊽", filterType: "moog"  },
+  { id: "sem_svf",       cat: "filter", label: "Oberheim SEM",   params: ["CUTOFF","RESONANCE","MORPH","NOTCH"],   icon: "⊽", filterType: "sem"   },
+  { id: "ms20_sk",       cat: "filter", label: "Korg MS-20",     params: ["CUTOFF","RESONANCE","PEAK","BITE"],     icon: "⊽", filterType: "ms20"  },
+  { id: "tb303_diode",   cat: "filter", label: "Roland TB-303",  params: ["CUTOFF","RESONANCE","ACCENT","SAT"],    icon: "⊽", filterType: "tb303" },
+
   { id: "amp_env",       cat: "env",    label: "Amp Env",        params: ["ATTACK","DECAY","SUSTAIN","RELEASE"],   icon: "⋀" },
   { id: "filter_env",    cat: "env",    label: "Filter Env",     params: ["ATTACK","DECAY","SUSTAIN","RELEASE"],   icon: "⋀" },
   { id: "lfo",           cat: "mod",    label: "LFO",            params: ["RATE","DEPTH","SHAPE","PHASE"],         icon: "~" },
   { id: "random",        cat: "mod",    label: "Random",         params: ["RATE","SMOOTHING","DEPTH"],             icon: "?" },
   { id: "delay",         cat: "fx",     label: "Delay",          params: ["TIME","FEEDBACK","MOD","MIX"],          icon: "◎" },
   { id: "reverb",        cat: "fx",     label: "Reverb",         params: ["SIZE","DECAY","DAMPING","MIX"],         icon: "◎" },
-  { id: "chorus",        cat: "fx",     label: "Chorus",         params: ["RATE","DEPTH","WIDTH","MIX"],           icon: "◎" },
+  { id: "juno60",        cat: "fx",     label: "Juno-60 Chorus", params: ["J-RATE","J-WIDTH"],                     icon: "〜", chorusType: "juno"  },
+  { id: "rs09",          cat: "fx",     label: "RS-09 Chorus",   params: ["R-RATE","R-WIDTH"],                     icon: "〜", chorusType: "rs09"  },
+  { id: "elec_mistress", cat: "fx",     label: "Elec Mistress",  params: ["E-RATE","E-WIDTH"],                     icon: "〜", chorusType: "mistress" },
 ];
 
 // ─── Piano Keys ───────────────────────────────────────────────────────────────
@@ -92,10 +99,94 @@ function createEngine() {
   };
   const masterGain = ctx.createGain(); masterGain.gain.value = 0.7;
   masterGain.connect(ctx.destination);
-  const filter = ctx.createBiquadFilter();
-  filter.type = "lowpass";
-  filter.frequency.value = 100 * Math.pow(180, p.cutoff);
-  filter.Q.value = p.resonance;
+
+  // ── Switchable filter graph ───────────────────────────────────────────────
+  // All topologies live between filterInput and filterOutput.
+  // noteOn always feeds filterInput; chain after filterOutput.
+  const filterInput  = ctx.createGain(); filterInput.gain.value  = 1;
+  const filterOutput = ctx.createGain(); filterOutput.gain.value = 1;
+
+  // Helper: soft-clip waveshaper (tanh approximation)
+  function makeClipper(amount = 1) {
+    const ws = ctx.createWaveShaper();
+    const n = 256; const curve = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = (i * 2) / n - 1;
+      curve[i] = Math.tanh(x * amount);
+    }
+    ws.curve = curve; ws.oversample = "2x";
+    return ws;
+  }
+
+  // ── Moog Ladder: two 12dB lowpass stages in series + saturation ──────────
+  const moogStage1  = ctx.createBiquadFilter(); moogStage1.type = "lowpass";
+  const moogStage2  = ctx.createBiquadFilter(); moogStage2.type = "lowpass";
+  const moogClipper = makeClipper(2);
+  const moogIn      = ctx.createGain();
+  const moogOut     = ctx.createGain();
+  moogIn.connect(moogClipper); moogClipper.connect(moogStage1);
+  moogStage1.connect(moogStage2); moogStage2.connect(moogOut);
+
+  // ── Oberheim SEM: lowpass + notch blend (SVF character) ──────────────────
+  const semLP    = ctx.createBiquadFilter(); semLP.type    = "lowpass";
+  const semNotch = ctx.createBiquadFilter(); semNotch.type = "notch";
+  const semLPGain    = ctx.createGain(); semLPGain.gain.value    = 0.7;
+  const semNotchGain = ctx.createGain(); semNotchGain.gain.value = 0.3; // morph target
+  const semIn = ctx.createGain(); const semOut = ctx.createGain();
+  semIn.connect(semLP);    semLP.connect(semLPGain);       semLPGain.connect(semOut);
+  semIn.connect(semNotch); semNotch.connect(semNotchGain); semNotchGain.connect(semOut);
+
+  // ── Korg MS-20: two stages with inter-stage hard clipper (aggressive) ────
+  const ms20Stage1  = ctx.createBiquadFilter(); ms20Stage1.type = "lowpass";
+  const ms20Stage2  = ctx.createBiquadFilter(); ms20Stage2.type = "lowpass";
+  const ms20Clip    = makeClipper(8); // harsh inter-stage distortion
+  const ms20Peak    = ctx.createBiquadFilter(); ms20Peak.type = "peaking";
+  ms20Peak.frequency.value = 2000; ms20Peak.gain.value = 6; ms20Peak.Q.value = 3;
+  const ms20In = ctx.createGain(); const ms20Out = ctx.createGain();
+  ms20In.connect(ms20Stage1); ms20Stage1.connect(ms20Clip);
+  ms20Clip.connect(ms20Stage2); ms20Stage2.connect(ms20Peak); ms20Peak.connect(ms20Out);
+
+  // ── Roland TB-303: lowpass + accent bandpass boost near cutoff ───────────
+  const tb303LP     = ctx.createBiquadFilter(); tb303LP.type = "lowpass";
+  const tb303BP     = ctx.createBiquadFilter(); tb303BP.type = "bandpass";
+  const tb303HPout  = ctx.createBiquadFilter(); tb303HPout.type = "highpass";
+  tb303HPout.frequency.value = 40; // remove sub rumble
+  const tb303BPGain = ctx.createGain(); tb303BPGain.gain.value = 0.3; // accent amount
+  const tb303Sat    = makeClipper(1.5);
+  const tb303In = ctx.createGain(); const tb303Out = ctx.createGain();
+  tb303In.connect(tb303Sat); tb303Sat.connect(tb303LP);
+  tb303LP.connect(tb303HPout); tb303HPout.connect(tb303Out);
+  tb303In.connect(tb303BP);   tb303BP.connect(tb303BPGain); tb303BPGain.connect(tb303Out);
+
+  // Sync all filter frequencies to same p.cutoff on init
+  let activeFilterType = "moog";
+  function setFilterFreqs(hz, q) {
+    [moogStage1, moogStage2].forEach(f => { f.frequency.value = hz; f.Q.value = q * 6; });
+    [semLP, semNotch].forEach(f => { f.frequency.value = hz; f.Q.value = q * 8; });
+    [ms20Stage1, ms20Stage2].forEach(f => { f.frequency.value = hz; f.Q.value = q * 12; });
+    ms20Peak.frequency.value = Math.min(hz * 1.5, 18000);
+    [tb303LP, tb303BP].forEach(f => { f.frequency.value = hz; f.Q.value = q * 10; });
+    tb303BP.frequency.value = Math.min(hz * 1.2, 18000);
+  }
+
+  // Route filterInput → active topology → filterOutput
+  function connectFilter(type) {
+    // Disconnect all topology inputs from filterInput
+    try { filterInput.disconnect(); } catch(e) {}
+    // Disconnect all topology outputs from filterOutput
+    [moogOut, semOut, ms20Out, tb303Out].forEach(o => { try { o.disconnect(filterOutput); } catch(e) {} });
+    activeFilterType = type;
+    if (type === "moog")  { filterInput.connect(moogIn);   moogOut.connect(filterOutput);  }
+    if (type === "sem")   { filterInput.connect(semIn);    semOut.connect(filterOutput);   }
+    if (type === "ms20")  { filterInput.connect(ms20In);   ms20Out.connect(filterOutput);  }
+    if (type === "tb303") { filterInput.connect(tb303In);  tb303Out.connect(filterOutput); }
+  }
+  connectFilter("moog"); // default
+
+  const initHz = 100 * Math.pow(180, p.cutoff);
+  setFilterFreqs(initHz, p.resonance);
+
+  // ── FX chain after filterOutput ───────────────────────────────────────────
   const convolver = ctx.createConvolver();
   const reverbGain = ctx.createGain(); reverbGain.gain.value = 0.2;
   const dryGain    = ctx.createGain(); dryGain.gain.value    = 0.8;
@@ -109,46 +200,147 @@ function createEngine() {
   const delayNode    = ctx.createDelay(2.0); delayNode.delayTime.value = p.delayTime;
   const delayFbGain  = ctx.createGain();     delayFbGain.gain.value    = p.delayFb;
   const delayMixGain = ctx.createGain();     delayMixGain.gain.value   = 0;
-  filter.connect(dryGain);
-  filter.connect(convolver); convolver.connect(reverbGain);
-  filter.connect(delayMixGain); delayMixGain.connect(delayNode);
+  filterOutput.connect(dryGain);
+  filterOutput.connect(convolver); convolver.connect(reverbGain);
+  filterOutput.connect(delayMixGain); delayMixGain.connect(delayNode);
   delayNode.connect(delayFbGain); delayFbGain.connect(delayNode);
   delayNode.connect(masterGain);
   dryGain.connect(masterGain); reverbGain.connect(masterGain);
+
+  // ── Helper: build one BBD chorus voice ────────────────────────────────────
+  // Returns { lfoL, lfoR, delayL, delayR, wetGainL, wetGainR, lfoGainL, lfoGainR }
+  function buildChorusVoice(baseDelayMs, lfoHz, lfoDepthMs, feedback = 0) {
+    const baseS  = baseDelayMs / 1000;
+    const depthS = lfoDepthMs  / 1000;
+
+    const delayL = ctx.createDelay(0.05); delayL.delayTime.value = baseS;
+    const delayR = ctx.createDelay(0.05); delayR.delayTime.value = baseS;
+
+    // Two LFOs 90° apart for stereo width
+    const lfoL = ctx.createOscillator(); lfoL.type = "sine"; lfoL.frequency.value = lfoHz;
+    const lfoR = ctx.createOscillator(); lfoR.type = "sine"; lfoR.frequency.value = lfoHz;
+    const lfoGainL = ctx.createGain(); lfoGainL.gain.value = depthS;
+    const lfoGainR = ctx.createGain(); lfoGainR.gain.value = depthS;
+    lfoL.connect(lfoGainL); lfoGainL.connect(delayL.delayTime);
+    lfoR.connect(lfoGainR); lfoGainR.connect(delayR.delayTime);
+
+    // Optional feedback
+    const fbGainL = ctx.createGain(); fbGainL.gain.value = feedback;
+    const fbGainR = ctx.createGain(); fbGainR.gain.value = feedback;
+    delayL.connect(fbGainL); fbGainL.connect(delayL);
+    delayR.connect(fbGainR); fbGainR.connect(delayR);
+
+    const wetL = ctx.createGain(); wetL.gain.value = 0; // off until enabled
+    const wetR = ctx.createGain(); wetR.gain.value = 0;
+    delayL.connect(wetL); delayR.connect(wetR);
+
+    // Merge stereo wet into a channel merger → master
+    const merger = ctx.createChannelMerger(2);
+    wetL.connect(merger, 0, 0);
+    wetR.connect(merger, 0, 1);
+    merger.connect(masterGain);
+
+    lfoL.start(); lfoR.start();
+
+    // Phase-offset lfoR by 90° using a small delay
+    const phaseDelay = (1 / lfoHz) * 0.25;
+    lfoR.start(ctx.currentTime + phaseDelay);
+
+    return { delayL, delayR, lfoL, lfoR, lfoGainL, lfoGainR, wetL, wetR, fbGainL, fbGainR };
+  }
+
+  // ── Juno-60 Chorus ────────────────────────────────────────────────────────
+  // Character: lush, wide, slightly wobbly BBD. ~7ms base, ~0.5Hz mod.
+  // Two parallel voices for Mode I + Mode II blend.
+  const juno = buildChorusVoice(7.0, 0.5, 1.8, 0.0);
+  const juno2 = buildChorusVoice(7.2, 0.83, 2.1, 0.0); // Mode II voice
+  // Feed filterOutput into both juno delay lines
+  filterOutput.connect(juno.delayL);  filterOutput.connect(juno.delayR);
+  filterOutput.connect(juno2.delayL); filterOutput.connect(juno2.delayR);
+
+  // ── Roland RS-09 Chorus ───────────────────────────────────────────────────
+  // Character: warm, slow, subtle. Shorter delay, lower rate — string ensemble thickening.
+  const rs09 = buildChorusVoice(3.5, 0.28, 0.9, 0.0);
+  filterOutput.connect(rs09.delayL); filterOutput.connect(rs09.delayR);
+
+  // ── EHX Electric Mistress (Flanger) ───────────────────────────────────────
+  // Character: metallic, sweeping, jet-plane. Very short delay (1–5ms), strong feedback.
+  const mistress = buildChorusVoice(2.5, 0.35, 2.0, 0.55);
+  filterOutput.connect(mistress.delayL); filterOutput.connect(mistress.delayR);
+
+  // Setters for each chorus — RATE maps to lfoHz, WIDTH maps to stereo depth
+  function setChorusRate(voice, hz) {
+    voice.lfoL.frequency.setTargetAtTime(hz, ctx.currentTime, 0.1);
+    voice.lfoR.frequency.setTargetAtTime(hz, ctx.currentTime, 0.1);
+  }
+  function setChorusWidth(voice, depth, baseDepth) {
+    const depthS = (baseDepth * depth) / 1000;
+    voice.lfoGainL.gain.setTargetAtTime(depthS,        ctx.currentTime, 0.05);
+    voice.lfoGainR.gain.setTargetAtTime(depthS * 1.15, ctx.currentTime, 0.05); // R slightly wider
+  }
+  function enableChorus(voice, on, wetLevel = 0.45) {
+    voice.wetL.gain.setTargetAtTime(on ? wetLevel : 0, ctx.currentTime, 0.05);
+    voice.wetR.gain.setTargetAtTime(on ? wetLevel : 0, ctx.currentTime, 0.05);
+  }
   const lfo = ctx.createOscillator(); lfo.type = "sine";
   lfo.frequency.value = p.lfoRate;
   const lfoGain = ctx.createGain(); lfoGain.gain.value = 0;
   lfo.connect(lfoGain); lfo.start();
+  // Per-oscillator mix levels for Classic Osc
+  const mix = { saw: 0.5, pulse: 0.0, tri: 0.0, sub: 0.0 };
+
   const activeNotes = {};
   function noteOn(freq, oscType = "sawtooth") {
     if (ctx.state === "suspended") ctx.resume();
     if (activeNotes[freq]) noteOff(freq);
-    const osc = ctx.createOscillator();
+
     const envGain = ctx.createGain();
-    const noteData = { osc, envGain };
-    osc.type = oscType; osc.frequency.value = freq;
-    osc.detune.value = p.detune * 100;
-    if (oscType === "sine") {
-      const mod = ctx.createOscillator(); const modGain = ctx.createGain();
-      mod.frequency.value = freq * 2.001; modGain.gain.value = freq * 0.3;
-      mod.connect(modGain); modGain.connect(osc.frequency); mod.start();
-      noteData.mod = mod;
+    envGain.connect(filterInput);
+    const noteData = { envGain, oscs: [] };
+
+    if (oscType === "classic") {
+      // Four separate oscillators, each with its own gain
+      const defs = [
+        { type:"sawtooth", gainVal: mix.saw  },
+        { type:"square",   gainVal: mix.pulse },
+        { type:"triangle", gainVal: mix.tri   },
+        { type:"sawtooth", gainVal: mix.sub, detuneSemis: -12 }, // sub oct
+      ];
+      defs.forEach(def => {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type = def.type;
+        o.frequency.value = freq;
+        o.detune.value = (def.detuneSemis || 0) * 100 + p.detune * 100;
+        g.gain.value = def.gainVal * p.drive;
+        lfoGain.connect(o.frequency);
+        o.connect(g); g.connect(envGain);
+        o.start(); 
+        noteData.oscs.push({ osc: o, gainNode: g, role: def.detuneSemis ? "sub" : def.type });
+      });
+    } else {
+      const osc = ctx.createOscillator();
+      osc.type = oscType; osc.frequency.value = freq;
+      osc.detune.value = p.detune * 100;
+      const g = ctx.createGain(); g.gain.value = 0.4 * p.drive;
+      lfoGain.connect(osc.frequency);
+      osc.connect(g); g.connect(envGain);
+      osc.start();
+      noteData.oscs.push({ osc, gainNode: g, role: oscType });
     }
-    lfoGain.connect(osc.frequency);
-    osc.connect(envGain); envGain.connect(filter);
-    const atk  = Math.max(0.001, p.attack);
-    const dec  = Math.max(0.01,  p.decay);
-    const sus  = Math.max(0.001, p.sustain);
-    const peak = p.oscLevel * p.drive;
-    const now  = ctx.currentTime;
+
+    const atk = Math.max(0.001, p.attack);
+    const dec = Math.max(0.01,  p.decay);
+    const sus = Math.max(0.001, p.sustain);
+    const now = ctx.currentTime;
     envGain.gain.setValueAtTime(0, now);
-    envGain.gain.linearRampToValueAtTime(peak,       now + atk);
-    envGain.gain.linearRampToValueAtTime(peak * sus, now + atk + dec);
-    filter.frequency.value = 100 * Math.pow(180, p.cutoff);
-    filter.Q.value = Math.max(0.1, p.resonance * 10);
-    osc.start(now);
+    envGain.gain.linearRampToValueAtTime(1.0,       now + atk);
+    envGain.gain.linearRampToValueAtTime(sus,        now + atk + dec);
+    const hz = 100 * Math.pow(180, p.cutoff);
+    setFilterFreqs(hz, p.resonance);
     activeNotes[freq] = noteData;
   }
+
   function noteOff(freq) {
     const note = activeNotes[freq]; if (!note) return;
     const rel = Math.max(0.01, p.release);
@@ -156,25 +348,48 @@ function createEngine() {
     note.envGain.gain.cancelScheduledValues(now);
     note.envGain.gain.setValueAtTime(note.envGain.gain.value, now);
     note.envGain.gain.linearRampToValueAtTime(0, now + rel);
-    note.osc.stop(now + rel + 0.01);
-    if (note.mod) note.mod.stop(now + rel + 0.01);
+    const stopAt = now + rel + 0.01;
+    note.oscs.forEach(({ osc }) => osc.stop(stopAt));
     delete activeNotes[freq];
   }
+
+  // Live-update mix gains on all active notes
+  function updateMixGains() {
+    Object.values(activeNotes).forEach(note => {
+      note.oscs.forEach(({ gainNode, role }) => {
+        const v = role === "sawtooth" ? mix.saw
+                : role === "square"   ? mix.pulse
+                : role === "triangle" ? mix.tri
+                : role === "sub"      ? mix.sub : 0.4;
+        gainNode.gain.setTargetAtTime(v * p.drive, ctx.currentTime, 0.02);
+      });
+    });
+  }
+
   const setters = {
     ATTACK:       v => { p.attack    = 0.001 + v * 3.0; },
     DECAY:        v => { p.decay     = 0.01  + v * 2.0; },
     SUSTAIN:      v => { p.sustain   = v; },
     RELEASE:      v => { p.release   = 0.01  + v * 4.0; },
-    CUTOFF:       v => { p.cutoff    = v; filter.frequency.value = 100 * Math.pow(180, v); },
-    RESONANCE:    v => { p.resonance = v; filter.Q.value = Math.max(0.1, v * 20); },
-    MORPH:        v => { p.cutoff    = v; filter.frequency.value = 100 * Math.pow(180, v); },
-    DRIVE:        v => { p.drive     = 0.2 + v * 3; },
+    CUTOFF:       v => { p.cutoff = v; const hz = 100*Math.pow(180,v); setFilterFreqs(hz, p.resonance); },
+    RESONANCE:    v => { p.resonance = v; const hz = 100*Math.pow(180,p.cutoff); setFilterFreqs(hz,v); },
+    // Moog-specific
+    DRIVE:        v => { p.drive = 0.2 + v * 3; updateMixGains(); },
     "KEY TRK":    v => {},
-    SAW:          v => { p.oscLevel  = 0.1 + v * 0.5; },
-    PULSE:        v => { p.oscLevel  = 0.1 + v * 0.5; },
-    TRI:          v => { p.oscLevel  = 0.1 + v * 0.5; },
-    SUB:          v => { p.oscLevel  = 0.05 + v * 0.2; },
-    LEVEL:        v => { p.oscLevel  = 0.1 + v * 0.5; },
+    // SEM-specific: Morph blends LP→Notch
+    MORPH:        v => { semLPGain.gain.setTargetAtTime(1-v*0.8, ctx.currentTime, 0.02); semNotchGain.gain.setTargetAtTime(v*0.8, ctx.currentTime, 0.02); },
+    NOTCH:        v => { semNotchGain.gain.setTargetAtTime(v, ctx.currentTime, 0.02); },
+    // MS-20-specific
+    PEAK:         v => { ms20Peak.gain.value = v * 18; },
+    BITE:         v => { const c = makeClipper(1 + v * 12); /* rebuild curve */ ms20Clip.curve = c.curve; },
+    // TB-303-specific
+    ACCENT:       v => { tb303BPGain.gain.setTargetAtTime(v * 0.8, ctx.currentTime, 0.02); },
+    SAT:          v => { const c = makeClipper(0.5 + v * 4); tb303Sat.curve = c.curve; },
+    SAW:          v => { mix.saw   = v; updateMixGains(); },
+    PULSE:        v => { mix.pulse = v; updateMixGains(); },
+    TRI:          v => { mix.tri   = v; updateMixGains(); },
+    SUB:          v => { mix.sub   = v * 0.7; updateMixGains(); },
+    LEVEL:        v => { p.oscLevel = 0.1 + v * 0.5; },
     POSITION:     v => {},
     WARP:         v => {},
     SPREAD:       v => {},
@@ -194,8 +409,17 @@ function createEngine() {
     MOD:          v => { lfoGain.gain.value = v * 40; },
     MIX:          v => { delayMixGain.gain.setTargetAtTime(v*0.7, ctx.currentTime, 0.05); reverbGain.gain.setTargetAtTime(v*0.5, ctx.currentTime, 0.05); },
     SIZE:         v => { reverbGain.gain.setTargetAtTime(v * 0.6, ctx.currentTime, 0.05); },
-    DAMPING:      v => { filter.frequency.value = 2000 + v * 16000; },
+    DAMPING:      v => { /* soften reverb HF — approximate via reverbGain tilt */ reverbGain.gain.setTargetAtTime(v * 0.5, ctx.currentTime, 0.05); },
     WIDTH:        v => { lfoGain.gain.value = v * 20; },
+    // ── Juno-60 Chorus ──
+    "J-RATE":     v => { const hz = 0.1 + v * 1.5;  setChorusRate(juno, hz); setChorusRate(juno2, hz * 1.66); },
+    "J-WIDTH":    v => { setChorusWidth(juno, v, 3.5); setChorusWidth(juno2, v, 4.0); },
+    // ── RS-09 Chorus ──
+    "R-RATE":     v => { setChorusRate(rs09, 0.1 + v * 0.6); },
+    "R-WIDTH":    v => { setChorusWidth(rs09, v, 2.0); },
+    // ── Electric Mistress ──
+    "E-RATE":     v => { setChorusRate(mistress, 0.05 + v * 0.8); },
+    "E-WIDTH":    v => { setChorusWidth(mistress, v, 4.5); mistress.fbGainL.gain.setTargetAtTime(0.3 + v * 0.55, ctx.currentTime, 0.05); mistress.fbGainR.gain.setTargetAtTime(0.3 + v * 0.55, ctx.currentTime, 0.05); },
     "ENV AMT":    v => { p.sustain   = v; },
     "LFO RATE":   v => { p.lfoRate   = 0.05 + v * 19.95; lfo.frequency.value = p.lfoRate; },
     "DELAY TIME": v => { p.delayTime = 0.05 + v * 1.5; delayNode.delayTime.setTargetAtTime(p.delayTime, ctx.currentTime, 0.05); },
@@ -204,8 +428,14 @@ function createEngine() {
   };
   function enableDelay(on) { delayMixGain.gain.setTargetAtTime(on ? 0.4 : 0, ctx.currentTime, 0.05); }
   function enableLfo(on)   { lfoGain.gain.value = on ? 30 : 0; }
+  function setFilterType(type) { connectFilter(type); }
+  function activateChorus(type, on) {
+    if (type === "juno")     { enableChorus(juno, on, 0.4); enableChorus(juno2, on, 0.3); }
+    if (type === "rs09")     { enableChorus(rs09, on, 0.45); }
+    if (type === "mistress") { enableChorus(mistress, on, 0.5); }
+  }
   function setParam(label, val) { const fn = setters[label]; if (fn) fn(val); }
-  return { ctx, noteOn, noteOff, setParam, enableDelay, enableLfo };
+  return { ctx, noteOn, noteOff, setParam, setFilterType, enableDelay, enableLfo, activateChorus };
 }
 
 // ─── OledLabel ────────────────────────────────────────────────────────────────
@@ -329,8 +559,10 @@ function PianoKey({ keyDef, onNoteOn, onNoteOff, active }) {
 }
 function Piano({ onNoteOn, onNoteOff, activeFreqs }) {
   return (
-    <div style={{ display:"flex",alignItems:"flex-start",background:"#1A1720",borderRadius:"0 0 6px 6px",padding:"6px 8px 10px",border:"1px solid #333",boxShadow:"inset 0 3px 8px #0006",overflowX:"auto" }}>
-      {KEYS.map(k=><PianoKey key={k.id} keyDef={k} onNoteOn={onNoteOn} onNoteOff={onNoteOff} active={activeFreqs.has(k.freq)}/>)}
+    <div style={{ width:"100%", background:"#1A1720",borderRadius:"0 0 10px 10px",padding:"6px 8px 10px",border:"1px solid #333",boxShadow:"inset 0 3px 8px #0006",overflowX:"auto",display:"flex",alignItems:"flex-start",justifyContent:"center" }}>
+      <div style={{ display:"flex", alignItems:"flex-start" }}>
+        {KEYS.map(k=><PianoKey key={k.id} keyDef={k} onNoteOn={onNoteOn} onNoteOff={onNoteOff} active={activeFreqs.has(k.freq)}/>)}
+      </div>
     </div>
   );
 }
@@ -387,6 +619,132 @@ function TouchStrip() {
   );
 }
 
+// ─── Marching ants animation ──────────────────────────────────────────────────
+const MARCH_STYLE = `
+@keyframes march {
+  to { stroke-dashoffset: -20; }
+}
+`;
+
+// ─── SliderZone ───────────────────────────────────────────────────────────────
+// Wraps all 16 sliders and draws a pink bounding box around the preview group
+function SliderZone({ slots, previewSlots, dragBlock, dragOver, setDragOver, onDrop, onChange }) {
+  const containerRef = useRef();
+  const slotRefs     = useRef([]);
+  const [boxRect, setBoxRect] = useState(null);
+  const color = dragBlock ? CAT[dragBlock.cat].color : PINK;
+
+  // Recompute bounding box whenever previewSlots changes
+  useEffect(() => {
+    if (!previewSlots.length || !containerRef.current) { setBoxRect(null); return; }
+    const containerR = containerRef.current.getBoundingClientRect();
+    const rects = previewSlots
+      .map(i => slotRefs.current[i]?.getBoundingClientRect())
+      .filter(Boolean);
+    if (!rects.length) { setBoxRect(null); return; }
+    const pad = 6;
+    setBoxRect({
+      left:   rects[0].left   - containerR.left - pad,
+      top:    rects[0].top    - containerR.top  - pad,
+      width:  rects[rects.length-1].right - rects[0].left + pad * 2,
+      height: rects[0].height + pad * 2,
+    });
+  }, [previewSlots]);
+
+  return (
+    <div ref={containerRef} style={{ position:"relative", display:"flex", gap:5, justifyContent:"center" }}
+      onDragOver={e => e.preventDefault()}
+      onDragLeave={e => { if (!containerRef.current?.contains(e.relatedTarget)) setDragOver(null); }}
+    >
+      <style>{MARCH_STYLE}</style>
+
+      {/* Marching-ants SVG overlay */}
+      {boxRect && (
+        <svg style={{ position:"absolute", left:0, top:0, width:"100%", height:"100%", pointerEvents:"none", overflow:"visible", zIndex:10 }}>
+          <rect
+            x={boxRect.left} y={boxRect.top}
+            width={boxRect.width} height={boxRect.height}
+            rx="6" ry="6"
+            fill={color + "18"}
+            stroke={color}
+            strokeWidth="1.5"
+            strokeDasharray="6 4"
+            style={{ animation:"march 0.4s linear infinite" }}
+          />
+        </svg>
+      )}
+
+      {slots.map((slot, i) => (
+        <div key={i} ref={el => slotRefs.current[i] = el}>
+          <Slider
+            slotId={i} label={slot.label} color={slot.color||DIM}
+            value={slot.value} assigned={!!slot.label}
+            highlighted={previewSlots.includes(i)}
+            onDrop={onDrop} dragOver={dragOver} setDragOver={setDragOver} onChange={onChange}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── EncoderZone ──────────────────────────────────────────────────────────────
+function EncoderZone({ encoders, previewEncoders, dragBlock, dragOver, setDragOver, onDrop, onChange }) {
+  const containerRef = useRef();
+  const encRefs      = useRef([]);
+  const [boxRect, setBoxRect] = useState(null);
+  const color = dragBlock ? CAT[dragBlock.cat].color : PINK;
+
+  useEffect(() => {
+    if (!previewEncoders.length || !containerRef.current) { setBoxRect(null); return; }
+    const containerR = containerRef.current.getBoundingClientRect();
+    const rects = previewEncoders
+      .map(i => encRefs.current[i]?.getBoundingClientRect())
+      .filter(Boolean);
+    if (!rects.length) { setBoxRect(null); return; }
+    const pad = 6;
+    // encoders are in a 4-col grid so may wrap — use min/max across all
+    const left   = Math.min(...rects.map(r => r.left))   - containerR.left - pad;
+    const top    = Math.min(...rects.map(r => r.top))    - containerR.top  - pad;
+    const right  = Math.max(...rects.map(r => r.right))  - containerR.left + pad;
+    const bottom = Math.max(...rects.map(r => r.bottom)) - containerR.top  + pad;
+    setBoxRect({ left, top, width: right - left, height: bottom - top });
+  }, [previewEncoders]);
+
+  return (
+    <div ref={containerRef} style={{ position:"relative", display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:6 }}
+      onDragOver={e => e.preventDefault()}
+      onDragLeave={e => { if (!containerRef.current?.contains(e.relatedTarget)) setDragOver(null); }}
+    >
+      {boxRect && (
+        <svg style={{ position:"absolute", left:0, top:0, width:"100%", height:"100%", pointerEvents:"none", overflow:"visible", zIndex:10 }}>
+          <rect
+            x={boxRect.left} y={boxRect.top}
+            width={boxRect.width} height={boxRect.height}
+            rx="6" ry="6"
+            fill={color + "18"}
+            stroke={color}
+            strokeWidth="1.5"
+            strokeDasharray="6 4"
+            style={{ animation:"march 0.4s linear infinite" }}
+          />
+        </svg>
+      )}
+
+      {encoders.map((enc, i) => (
+        <div key={i} ref={el => encRefs.current[i] = el}>
+          <Encoder
+            slotId={i} label={enc.assigned?enc.label:enc.defaultLabel}
+            color={enc.color||DIM} value={enc.value} assigned={enc.assigned}
+            highlighted={previewEncoders.includes(i)}
+            onDrop={onDrop} dragOver={dragOver} setDragOver={setDragOver} onChange={onChange}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 function App() {
   const engineRef = useRef(null);
@@ -414,7 +772,9 @@ function App() {
 
   const currentOscType = useCallback(()=>{
     const b = activeBlocks.find(b=>b.cat==="osc");
-    return b?.oscType||"sawtooth";
+    if (!b) return "sawtooth";
+    if (b.id === "classic_osc") return "classic";
+    return b.oscType || "sawtooth";
   },[activeBlocks]);
 
   const noteOn = useCallback(freq=>{
@@ -431,9 +791,15 @@ function App() {
   useEffect(()=>{
     if(!engineRef.current)return;
     const eng=engineRef.current;
+    // Switch filter topology when a filter block is loaded
+    const filterBlock = activeBlocks.find(b=>b.cat==="filter");
+    if (filterBlock?.filterType) eng.setFilterType(filterBlock.filterType);
     eng.enableDelay(activeBlocks.some(b=>b.id==="delay"));
     eng.enableLfo(activeBlocks.some(b=>b.cat==="mod"));
-    if(activeBlocks.some(b=>b.cat==="filter")) eng.setParam("CUTOFF",0.55);
+    // Enable whichever chorus blocks are loaded, disable others
+    ["juno","rs09","mistress"].forEach(type => {
+      eng.activateChorus(type, activeBlocks.some(b=>b.chorusType===type));
+    });
   },[activeBlocks]);
 
   const handleDrop = useCallback((slotId,target)=>{
@@ -480,11 +846,7 @@ function App() {
             {/* Encoders */}
             <div style={{ display:"flex",flexDirection:"column",gap:6 }}>
               <div style={{ fontSize:8,color:dragBlock?PINK:DIM,letterSpacing:"0.1em",textTransform:"uppercase",textAlign:"center",transition:"color 0.2s" }}>ENCODERS {dragBlock&&"· drop here"}</div>
-              <div style={{ display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6 }}>
-                {encoders.map((enc,i)=>(
-                  <Encoder key={i} slotId={i} label={enc.assigned?enc.label:enc.defaultLabel} color={enc.color||DIM} value={enc.value} assigned={enc.assigned} highlighted={previewEncoders.includes(i)} onDrop={handleDrop} dragOver={dragOver} setDragOver={setDragOver} onChange={handleEncoderChange}/>
-                ))}
-              </div>
+              <EncoderZone encoders={encoders} previewEncoders={previewEncoders} dragBlock={dragBlock} dragOver={dragOver} setDragOver={setDragOver} onDrop={handleDrop} onChange={handleEncoderChange}/>
             </div>
 
             <div style={{ width:1,background:PANEL_EDGE,alignSelf:"stretch",margin:"0 4px" }}/>
@@ -492,11 +854,7 @@ function App() {
             {/* Sliders */}
             <div style={{ flex:1 }}>
               <div style={{ fontSize:8,color:dragBlock?PINK:DIM,letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:8,textAlign:"center",transition:"color 0.2s" }}>SLIDERS {dragBlock?"· drop here":"· drag blocks here"}</div>
-              <div style={{ display:"flex",gap:5,justifyContent:"center" }}>
-                {slots.map((slot,i)=>(
-                  <Slider key={i} slotId={i} label={slot.label} color={slot.color||DIM} value={slot.value} assigned={!!slot.label} highlighted={previewSlots.includes(i)} onDrop={handleDrop} dragOver={dragOver} setDragOver={setDragOver} onChange={handleSliderChange}/>
-                ))}
-              </div>
+              <SliderZone slots={slots} previewSlots={previewSlots} dragBlock={dragBlock} dragOver={dragOver} setDragOver={setDragOver} onDrop={handleDrop} onChange={handleSliderChange}/>
             </div>
 
             <div style={{ width:1,background:PANEL_EDGE,alignSelf:"stretch",margin:"0 4px" }}/>
