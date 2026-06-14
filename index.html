@@ -58,6 +58,7 @@ const BLOCKS = [
   { id: "amp_env",       cat: "env",    label: "Amp Env",        params: ["ATTACK","DECAY","SUSTAIN","RELEASE"],   icon: "⋀" },
   { id: "filter_env",    cat: "env",    label: "Filter Env",     params: ["ATTACK","DECAY","SUSTAIN","RELEASE"],   icon: "⋀" },
   { id: "lfo",           cat: "mod",    label: "LFO",            params: ["RATE","DEPTH","SHAPE","PHASE"],         icon: "~" },
+  { id: "lfo_dest",      cat: "mod",    label: "LFO Dest",       params: ["DEST"],                                 icon: "⊙", isDestBlock: true },
   { id: "random",        cat: "mod",    label: "Random",         params: ["RATE","SMOOTHING","DEPTH"],             icon: "?" },
   { id: "delay",         cat: "fx",     label: "Delay",          params: ["TIME","FEEDBACK","MOD","MIX"],          icon: "◎" },
   { id: "reverb",        cat: "fx",     label: "Reverb",         params: ["SIZE","DECAY","DAMPING","MIX"],         icon: "◎" },
@@ -208,7 +209,6 @@ function createEngine() {
   dryGain.connect(masterGain); reverbGain.connect(masterGain);
 
   // ── Helper: build one BBD chorus voice ────────────────────────────────────
-  // Returns { lfoL, lfoR, delayL, delayR, wetGainL, wetGainR, lfoGainL, lfoGainR }
   function buildChorusVoice(baseDelayMs, lfoHz, lfoDepthMs, feedback = 0) {
     const baseS  = baseDelayMs / 1000;
     const depthS = lfoDepthMs  / 1000;
@@ -216,37 +216,27 @@ function createEngine() {
     const delayL = ctx.createDelay(0.05); delayL.delayTime.value = baseS;
     const delayR = ctx.createDelay(0.05); delayR.delayTime.value = baseS;
 
-    // Two LFOs 90° apart for stereo width
-    const lfoL = ctx.createOscillator(); lfoL.type = "sine"; lfoL.frequency.value = lfoHz;
-    const lfoR = ctx.createOscillator(); lfoR.type = "sine"; lfoR.frequency.value = lfoHz;
-    const lfoGainL = ctx.createGain(); lfoGainL.gain.value = depthS;
-    const lfoGainR = ctx.createGain(); lfoGainR.gain.value = depthS;
-    lfoL.connect(lfoGainL); lfoGainL.connect(delayL.delayTime);
-    lfoR.connect(lfoGainR); lfoGainR.connect(delayR.delayTime);
+    // Single LFO, inverted for R channel to create stereo width
+    const lfo = ctx.createOscillator(); lfo.type = "sine"; lfo.frequency.value = lfoHz;
+    const lfoGainL = ctx.createGain(); lfoGainL.gain.value =  depthS;
+    const lfoGainR = ctx.createGain(); lfoGainR.gain.value = -depthS; // inverted = stereo spread
+    lfo.connect(lfoGainL); lfoGainL.connect(delayL.delayTime);
+    lfo.connect(lfoGainR); lfoGainR.connect(delayR.delayTime);
+    lfo.start();
 
-    // Optional feedback
+    // Feedback
     const fbGainL = ctx.createGain(); fbGainL.gain.value = feedback;
     const fbGainR = ctx.createGain(); fbGainR.gain.value = feedback;
     delayL.connect(fbGainL); fbGainL.connect(delayL);
     delayR.connect(fbGainR); fbGainR.connect(delayR);
 
-    const wetL = ctx.createGain(); wetL.gain.value = 0; // off until enabled
+    // Wet outputs — gain 0 until enabled, connect directly to masterGain
+    const wetL = ctx.createGain(); wetL.gain.value = 0;
     const wetR = ctx.createGain(); wetR.gain.value = 0;
-    delayL.connect(wetL); delayR.connect(wetR);
+    delayL.connect(wetL); wetL.connect(masterGain);
+    delayR.connect(wetR); wetR.connect(masterGain);
 
-    // Merge stereo wet into a channel merger → master
-    const merger = ctx.createChannelMerger(2);
-    wetL.connect(merger, 0, 0);
-    wetR.connect(merger, 0, 1);
-    merger.connect(masterGain);
-
-    lfoL.start(); lfoR.start();
-
-    // Phase-offset lfoR by 90° using a small delay
-    const phaseDelay = (1 / lfoHz) * 0.25;
-    lfoR.start(ctx.currentTime + phaseDelay);
-
-    return { delayL, delayR, lfoL, lfoR, lfoGainL, lfoGainR, wetL, wetR, fbGainL, fbGainR };
+    return { delayL, delayR, lfo, lfoGainL, lfoGainR, wetL, wetR, fbGainL, fbGainR };
   }
 
   // ── Juno-60 Chorus ────────────────────────────────────────────────────────
@@ -270,13 +260,12 @@ function createEngine() {
 
   // Setters for each chorus — RATE maps to lfoHz, WIDTH maps to stereo depth
   function setChorusRate(voice, hz) {
-    voice.lfoL.frequency.setTargetAtTime(hz, ctx.currentTime, 0.1);
-    voice.lfoR.frequency.setTargetAtTime(hz, ctx.currentTime, 0.1);
+    voice.lfo.frequency.setTargetAtTime(hz, ctx.currentTime, 0.1);
   }
   function setChorusWidth(voice, depth, baseDepth) {
     const depthS = (baseDepth * depth) / 1000;
-    voice.lfoGainL.gain.setTargetAtTime(depthS,        ctx.currentTime, 0.05);
-    voice.lfoGainR.gain.setTargetAtTime(depthS * 1.15, ctx.currentTime, 0.05); // R slightly wider
+    voice.lfoGainL.gain.setTargetAtTime( depthS, ctx.currentTime, 0.05);
+    voice.lfoGainR.gain.setTargetAtTime(-depthS, ctx.currentTime, 0.05);
   }
   function enableChorus(voice, on, wetLevel = 0.45) {
     voice.wetL.gain.setTargetAtTime(on ? wetLevel : 0, ctx.currentTime, 0.05);
@@ -284,8 +273,36 @@ function createEngine() {
   }
   const lfo = ctx.createOscillator(); lfo.type = "sine";
   lfo.frequency.value = p.lfoRate;
-  const lfoGain = ctx.createGain(); lfoGain.gain.value = 0;
-  lfo.connect(lfoGain); lfo.start();
+  // Separate gain nodes per destination so we can switch cleanly
+  const lfoGain      = ctx.createGain(); lfoGain.gain.value      = 0; // pitch (cents)
+  const lfoVolGain   = ctx.createGain(); lfoVolGain.gain.value   = 0; // volume (amplitude)
+  const lfoCutGain   = ctx.createGain(); lfoCutGain.gain.value   = 0; // filter cutoff (Hz)
+  const lfoResoGain  = ctx.createGain(); lfoResoGain.gain.value  = 0; // filter Q
+  lfo.connect(lfoGain);
+  lfo.connect(lfoVolGain);  lfoVolGain.connect(masterGain.gain);
+  // cutoff and reso connected per-topology in setLfoDest
+  lfo.start();
+  let lfoDepthValue  = 0;    // stored 0-1 from DEPTH slider
+  let lfoDestination = "PITCH"; // current dest label
+  function setLfoDest(dest) {
+    lfoDestination = dest;
+    // Reset all gains to 0 first
+    [lfoGain, lfoVolGain, lfoCutGain, lfoResoGain].forEach(g => g.gain.setTargetAtTime(0, ctx.currentTime, 0.02));
+    const depth = lfoDepthValue;
+    if (dest === "PITCH")  lfoGain.gain.setTargetAtTime(depth * 80, ctx.currentTime, 0.02);
+    if (dest === "VOLUME") lfoVolGain.gain.setTargetAtTime(depth * 0.3, ctx.currentTime, 0.02);
+    if (dest === "CUTOFF") {
+      // Connect to all filter freq AudioParams
+      [moogStage1,moogStage2,semLP,semNotch,ms20Stage1,ms20Stage2,tb303LP,tb303BP]
+        .forEach(f => { try { lfoCutGain.connect(f.frequency); } catch(e){} });
+      lfoCutGain.gain.setTargetAtTime(depth * 800, ctx.currentTime, 0.02);
+    }
+    if (dest === "RESO") {
+      [moogStage1,moogStage2,semLP,ms20Stage1,ms20Stage2,tb303LP]
+        .forEach(f => { try { lfoResoGain.connect(f.Q); } catch(e){} });
+      lfoResoGain.gain.setTargetAtTime(depth * 4, ctx.currentTime, 0.02);
+    }
+  }
   // Per-oscillator mix levels for Classic Osc
   const mix = { saw: 0.5, pulse: 0.0, tri: 0.0, sub: 0.0 };
 
@@ -401,7 +418,12 @@ function createEngine() {
     LOOP:         v => {},
     FEEDBACK:     v => { p.delayFb   = v * 0.92; delayFbGain.gain.setTargetAtTime(p.delayFb, ctx.currentTime, 0.05); },
     RATE:         v => { p.lfoRate   = 0.05 + v * 19.95; lfo.frequency.value = p.lfoRate; },
-    DEPTH:        v => { lfoGain.gain.value = v * 80; },
+    DEPTH:        v => { lfoDepthValue = v; setLfoDest(lfoDestination); },
+    DEST:         v => {
+      const dests = ["PITCH","VOLUME","CUTOFF","RESO"];
+      const dest  = dests[Math.round(v * (dests.length - 1))];
+      setLfoDest(dest);
+    },
     SHAPE:        v => { lfo.type    = ["sine","triangle","sawtooth","square"][Math.floor(v*3.99)]; },
     PHASE:        v => {},
     SMOOTHING:    v => {},
@@ -427,7 +449,11 @@ function createEngine() {
     VOLUME:       v => { masterGain.gain.setTargetAtTime(0.1 + v * 0.9, ctx.currentTime, 0.02); },
   };
   function enableDelay(on) { delayMixGain.gain.setTargetAtTime(on ? 0.4 : 0, ctx.currentTime, 0.05); }
-  function enableLfo(on)   { lfoGain.gain.value = on ? 30 : 0; }
+  function enableLfo(on) {
+    lfoDepthValue = on ? 0.3 : 0;
+    setLfoDest(lfoDestination);
+  }
+  function setLfoDestination(dest) { setLfoDest(dest); }
   function setFilterType(type) { connectFilter(type); }
   function activateChorus(type, on) {
     if (type === "juno")     { enableChorus(juno, on, 0.4); enableChorus(juno2, on, 0.3); }
@@ -435,7 +461,158 @@ function createEngine() {
     if (type === "mistress") { enableChorus(mistress, on, 0.5); }
   }
   function setParam(label, val) { const fn = setters[label]; if (fn) fn(val); }
-  return { ctx, noteOn, noteOff, setParam, setFilterType, enableDelay, enableLfo, activateChorus };
+  return { ctx, noteOn, noteOff, setParam, setFilterType, enableDelay, enableLfo, activateChorus, setLfoDestination };
+}
+
+// ─── DestKnob ─────────────────────────────────────────────────────────────────
+// A stepped 4-position rotary selector. Turns to snap through PITCH/VOLUME/CUTOFF/RESO.
+const DEST_OPTIONS = ["PITCH", "VOLUME", "CUTOFF", "RESO"];
+const DEST_COLORS  = { PITCH:"#6B7FD7", VOLUME:"#C47E4A", CUTOFF:"#5DB88A", RESO:"#9B6CC7" };
+
+function DestKnob({ value, onChange, color }) {
+  const size    = 52;
+  const cx      = size / 2;
+  const r       = cx - 6;
+  const numDest = DEST_OPTIONS.length;
+  const stepIdx = Math.round(value * (numDest - 1));
+  const dest    = DEST_OPTIONS[stepIdx];
+  const destColor = DEST_COLORS[dest];
+
+  // Map stepIdx → angle: spread across -135° to +135°
+  const angle   = -135 + (stepIdx / (numDest - 1)) * 270;
+  const rad     = angle * Math.PI / 180;
+  const dotX    = cx + r * Math.sin(rad);
+  const dotY    = cx - r * Math.cos(rad);
+
+  // Flash state for OLED label
+  const [flash, setFlash] = useState(false);
+  const prevIdx = useRef(stepIdx);
+  useEffect(() => {
+    if (stepIdx !== prevIdx.current) {
+      prevIdx.current = stepIdx;
+      setFlash(true);
+      const t = setTimeout(() => setFlash(false), 500);
+      return () => clearTimeout(t);
+    }
+  }, [stepIdx]);
+
+  // Drag to turn — snaps to nearest detent
+  const startRef = useRef(null);
+  const onMouseDown = e => {
+    e.preventDefault();
+    startRef.current = { y: e.clientY, value };
+    const onMove = e2 => {
+      if (!startRef.current) return;
+      const raw = startRef.current.value + (startRef.current.y - e2.clientY) / 100;
+      const clamped = Math.max(0, Math.min(1, raw));
+      // Snap to nearest step
+      const snapped = Math.round(clamped * (numDest - 1)) / (numDest - 1);
+      onChange(snapped);
+    };
+    const onUp = () => { startRef.current = null; window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  const onTouchStart = e => { e.preventDefault(); startRef.current = { y: e.touches[0].clientY, value }; };
+  const onTouchMove  = e => {
+    if (!startRef.current) return; e.preventDefault();
+    const raw     = startRef.current.value + (startRef.current.y - e.touches[0].clientY) / 100;
+    const clamped = Math.max(0, Math.min(1, raw));
+    const snapped = Math.round(clamped * (numDest - 1)) / (numDest - 1);
+    onChange(snapped);
+  };
+  const onTouchEnd = () => { startRef.current = null; };
+
+  // Scroll wheel also steps through destinations
+  const onWheel = e => {
+    e.preventDefault();
+    const dir     = e.deltaY > 0 ? -1 : 1;
+    const newIdx  = Math.max(0, Math.min(numDest - 1, stepIdx + dir));
+    onChange(newIdx / (numDest - 1));
+  };
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:6, userSelect:"none" }}>
+
+      {/* Rotary body */}
+      <div style={{ position:"relative", width:size, height:size }}>
+        <svg width={size} height={size} style={{ cursor:"ns-resize", touchAction:"none" }}
+          onMouseDown={onMouseDown} onTouchStart={onTouchStart}
+          onTouchMove={onTouchMove} onTouchEnd={onTouchEnd} onWheel={onWheel}>
+          <defs>
+            <radialGradient id="destGrad" cx="35%" cy="30%" r="70%">
+              <stop offset="0%" stopColor="#3A3840"/>
+              <stop offset="100%" stopColor="#18161C"/>
+            </radialGradient>
+          </defs>
+
+          {/* Outer ring with detent marks */}
+          <circle cx={cx} cy={cx} r={cx-1} fill="url(#destGrad)"
+            stroke={destColor} strokeWidth="1.5"
+            style={{ filter:`drop-shadow(0 0 5px ${destColor}66)`, transition:"stroke 0.2s" }}/>
+
+          {/* Detent tick marks at each position */}
+          {DEST_OPTIONS.map((_, i) => {
+            const a   = (-135 + (i / (numDest - 1)) * 270) * Math.PI / 180;
+            const r1  = cx - 4;
+            const r2  = cx - 8;
+            const x1  = cx + r1 * Math.sin(a); const y1 = cx - r1 * Math.cos(a);
+            const x2  = cx + r2 * Math.sin(a); const y2 = cx - r2 * Math.cos(a);
+            const active = i === stepIdx;
+            return <line key={i} x1={x1} y1={y1} x2={x2} y2={y2}
+              stroke={active ? destColor : DIM} strokeWidth={active ? 2 : 1}
+              style={{ transition:"stroke 0.15s" }}/>;
+          })}
+
+          {/* Track arc */}
+          <circle cx={cx} cy={cx} r={r} fill="none" stroke="#222" strokeWidth="1.5"/>
+
+          {/* Position indicator dot */}
+          <circle cx={dotX} cy={dotY} r="3.5" fill={destColor}
+            style={{ filter:`drop-shadow(0 0 4px ${destColor})`, transition:"cx 0.15s,cy 0.15s,fill 0.2s" }}/>
+
+          {/* Center */}
+          <circle cx={cx} cy={cx} r="5" fill={destColor+"33"} stroke={destColor} strokeWidth="1"
+            style={{ transition:"fill 0.2s, stroke 0.2s" }}/>
+        </svg>
+      </div>
+
+      {/* OLED destination readout */}
+      <div style={{
+        background: OLED_BG,
+        border: `1px solid ${flash ? destColor : destColor+"55"}`,
+        borderRadius: 4, padding: "3px 8px",
+        minWidth: 60, textAlign: "center",
+        boxShadow: flash ? `0 0 10px ${destColor}99` : `0 0 4px ${destColor}33`,
+        transition: "border-color 0.2s, box-shadow 0.3s",
+      }}>
+        <div style={{ fontSize: 7, color: DIM, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:1 }}>LFO DEST</div>
+        <div style={{
+          fontFamily: "'Courier New', monospace",
+          fontSize: 11, fontWeight: 700,
+          color: flash ? destColor : destColor+"CC",
+          letterSpacing: "0.08em",
+          transition: "color 0.2s",
+        }}>{dest}</div>
+      </div>
+
+      {/* Step dots */}
+      <div style={{ display:"flex", gap:4 }}>
+        {DEST_OPTIONS.map((d, i) => (
+          <div key={d}
+            onClick={() => onChange(i / (numDest - 1))}
+            style={{
+              width: 5, height: 5, borderRadius:"50%",
+              background: i === stepIdx ? DEST_COLORS[d] : DIM,
+              boxShadow: i === stepIdx ? `0 0 4px ${DEST_COLORS[d]}` : "none",
+              cursor: "pointer",
+              transition: "background 0.15s, box-shadow 0.15s",
+            }}
+          />
+        ))}
+      </div>
+    </div>
+  );
 }
 
 // ─── OledLabel ────────────────────────────────────────────────────────────────
@@ -492,6 +669,18 @@ function Encoder({ slotId, label, color, value, assigned, highlighted, onDrop, d
   const size = 34; const cx = size/2; const r = cx-5;
   const startRef = useRef(null);
   const isHov = dragOver === `enc-${slotId}`;
+
+  // If this slot holds a DEST block, render the special knob
+  if (label === "DEST" && assigned) {
+    return (
+      <div style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:3 }}
+        onDragOver={e=>{e.preventDefault();setDragOver(`enc-${slotId}`);}}
+        onDragLeave={()=>setDragOver(null)}
+        onDrop={e=>{e.preventDefault();setDragOver(null);onDrop(slotId,"encoder");}}>
+        <DestKnob value={value} color={color} onChange={v => onChange(slotId, v)}/>
+      </div>
+    );
+  }
   const angle = -135 + value * 270;
   const rad   = angle * Math.PI / 180;
   const dotX  = cx + r * Math.sin(rad);
@@ -532,37 +721,40 @@ function Encoder({ slotId, label, color, value, assigned, highlighted, onDrop, d
 }
 
 // ─── Piano ────────────────────────────────────────────────────────────────────
-function PianoKey({ keyDef, onNoteOn, onNoteOff, active }) {
+function PianoKey({ keyDef, onNoteOn, onNoteOff, active, totalKeys }) {
   const w = keyDef.type === "white";
+  // White key flex-fills; black keys are absolutely positioned overlays
   return (
     <div
       style={w ? {
-        width:18,height:80,flexShrink:0,zIndex:0,
-        background:active?`linear-gradient(180deg,${PINK}CC,${PINK}88)`:"linear-gradient(180deg,#F5F0EB,#DDD8D0)",
-        border:"1px solid #999",borderRadius:"0 0 3px 3px",
-        boxShadow:active?`0 0 10px ${PINK}`:"inset -1px 0 0 #CCC,0 3px 4px #0008",
-        cursor:"pointer",transition:"background 0.05s,box-shadow 0.1s",
+        flex: 1, minWidth: 0, height: 90, flexShrink: 1, zIndex: 0, position: "relative",
+        background: active ? `linear-gradient(180deg,${PINK}CC,${PINK}88)` : "linear-gradient(180deg,#F5F0EB,#DDD8D0)",
+        border: "1px solid #999", borderRadius: "0 0 4px 4px",
+        boxShadow: active ? `0 0 10px ${PINK}` : "inset -1px 0 0 #CCC, 0 3px 4px #0008",
+        cursor: "pointer", transition: "background 0.05s, box-shadow 0.1s",
       } : {
-        width:12,height:50,flexShrink:0,zIndex:1,marginLeft:-6,marginRight:-6,
-        background:active?`linear-gradient(180deg,${PINK},${PINK_DARK})`:"linear-gradient(180deg,#111,#000)",
-        border:"1px solid #333",borderRadius:"0 0 2px 2px",
-        boxShadow:active?`0 0 10px ${PINK}`:"0 3px 4px #000A,inset 1px 0 0 #222",
-        cursor:"pointer",transition:"background 0.05s,box-shadow 0.1s",
+        // Black keys: negative margins to overlap white keys
+        width: "2.2%", minWidth: 12, maxWidth: 18, height: 58, flexShrink: 0, zIndex: 2,
+        marginLeft: "-1.1%", marginRight: "-1.1%",
+        background: active ? `linear-gradient(180deg,${PINK},${PINK_DARK})` : "linear-gradient(180deg,#1A1A1A,#000)",
+        border: "1px solid #222", borderRadius: "0 0 3px 3px",
+        boxShadow: active ? `0 0 10px ${PINK}` : "0 4px 6px #000A, inset 1px 0 0 #333",
+        cursor: "pointer", transition: "background 0.05s, box-shadow 0.1s",
       }}
-      onMouseDown={e=>{e.preventDefault();onNoteOn(keyDef.freq);}}
-      onMouseUp={()=>onNoteOff(keyDef.freq)}
-      onMouseLeave={()=>onNoteOff(keyDef.freq)}
-      onTouchStart={e=>{e.preventDefault();onNoteOn(keyDef.freq);}}
-      onTouchEnd={()=>onNoteOff(keyDef.freq)}
+      onMouseDown={e => { e.preventDefault(); onNoteOn(keyDef.freq); }}
+      onMouseUp={() => onNoteOff(keyDef.freq)}
+      onMouseLeave={() => onNoteOff(keyDef.freq)}
+      onTouchStart={e => { e.preventDefault(); onNoteOn(keyDef.freq); }}
+      onTouchEnd={() => onNoteOff(keyDef.freq)}
     />
   );
 }
 function Piano({ onNoteOn, onNoteOff, activeFreqs }) {
   return (
-    <div style={{ width:"100%", background:"#1A1720",borderRadius:"0 0 10px 10px",padding:"6px 8px 10px",border:"1px solid #333",boxShadow:"inset 0 3px 8px #0006",overflowX:"auto",display:"flex",alignItems:"flex-start",justifyContent:"center" }}>
-      <div style={{ display:"flex", alignItems:"flex-start" }}>
-        {KEYS.map(k=><PianoKey key={k.id} keyDef={k} onNoteOn={onNoteOn} onNoteOff={onNoteOff} active={activeFreqs.has(k.freq)}/>)}
-      </div>
+    <div style={{ width:"100%", background:"#1A1720", borderRadius:"0 0 10px 10px", boxShadow:"inset 0 3px 8px #0006", overflow:"hidden", display:"flex", alignItems:"flex-start" }}>
+      {KEYS.map(k => (
+        <PianoKey key={k.id} keyDef={k} onNoteOn={onNoteOn} onNoteOff={onNoteOff} active={activeFreqs.has(k.freq)} totalKeys={KEYS.filter(k=>k.type==="white").length}/>
+      ))}
     </div>
   );
 }
@@ -819,7 +1011,19 @@ function App() {
   },[]);
 
   const handleEncoderChange = useCallback((slotId,val)=>{
-    setEncoders(prev=>{const n=[...prev];const label=n[slotId].label;n[slotId]={...n[slotId],value:val};if(engineRef.current)engineRef.current.setParam(label,val);return n;});
+    setEncoders(prev=>{
+      const n=[...prev]; const label=n[slotId].label; n[slotId]={...n[slotId],value:val};
+      if(engineRef.current) {
+        engineRef.current.setParam(label,val);
+        // Special: DEST block also calls setLfoDestination with the string
+        if(label==="DEST") {
+          const dests=["PITCH","VOLUME","CUTOFF","RESO"];
+          const dest=dests[Math.round(val*(dests.length-1))];
+          engineRef.current.setLfoDestination(dest);
+        }
+      }
+      return n;
+    });
   },[]);
 
   const filteredBlocks = catFilter==="all"?BLOCKS:BLOCKS.filter(b=>b.cat===catFilter);
