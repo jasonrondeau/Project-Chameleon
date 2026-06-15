@@ -57,9 +57,10 @@ const BLOCKS = [
 
   { id: "amp_env",       cat: "env",    label: "Amp Env",        params: ["ATTACK","DECAY","SUSTAIN","RELEASE"],   icon: "⋀" },
   { id: "filter_env",    cat: "env",    label: "Filter Env",     params: ["ATTACK","DECAY","SUSTAIN","RELEASE"],   icon: "⋀" },
-  { id: "lfo",           cat: "mod",    label: "LFO",            params: ["RATE","DEPTH","SHAPE","PHASE"],         icon: "~" },
-  { id: "lfo_dest",      cat: "mod",    label: "LFO Dest",       params: ["DEST"],                                 icon: "⊙", isDestBlock: true },
-  { id: "random",        cat: "mod",    label: "Random",         params: ["RATE","SMOOTHING","DEPTH"],             icon: "?" },
+  { id: "lfo",           cat: "mod",    label: "LFO 1",          params: ["RATE","DEPTH","SHAPE","PHASE"],         icon: "~",  lfoIndex: 1 },
+  { id: "lfo2",          cat: "mod",    label: "LFO 2",          params: ["L2-RATE","L2-DEPTH","L2-SHAPE","PHASE"], icon: "~",  lfoIndex: 2 },
+  { id: "route",         cat: "mod",    label: "Route",          params: ["SOURCE","DEST"],                         icon: "⇝",  isRouteBlock: true, encoderOnly: true },
+  { id: "random",        cat: "mod",    label: "Random",         params: ["RATE","SMOOTHING","DEPTH"],              icon: "?" },
   { id: "delay",         cat: "fx",     label: "Delay",          params: ["TIME","FEEDBACK","MOD","MIX"],          icon: "◎" },
   { id: "reverb",        cat: "fx",     label: "Reverb",         params: ["SIZE","DECAY","DAMPING","MIX"],         icon: "◎" },
   { id: "juno60",        cat: "fx",     label: "Juno-60 Chorus", params: ["J-RATE","J-WIDTH"],                     icon: "〜", chorusType: "juno"  },
@@ -159,33 +160,66 @@ function createEngine() {
   tb303LP.connect(tb303HPout); tb303HPout.connect(tb303Out);
   tb303In.connect(tb303BP);   tb303BP.connect(tb303BPGain); tb303BPGain.connect(tb303Out);
 
-  // Sync all filter frequencies to same p.cutoff on init
-  let activeFilterType = "moog";
-  function setFilterFreqs(hz, q) {
-    [moogStage1, moogStage2].forEach(f => { f.frequency.value = hz; f.Q.value = q * 6; });
-    [semLP, semNotch].forEach(f => { f.frequency.value = hz; f.Q.value = q * 8; });
-    [ms20Stage1, ms20Stage2].forEach(f => { f.frequency.value = hz; f.Q.value = q * 12; });
-    ms20Peak.frequency.value = Math.min(hz * 1.5, 18000);
-    [tb303LP, tb303BP].forEach(f => { f.frequency.value = hz; f.Q.value = q * 10; });
-    tb303BP.frequency.value = Math.min(hz * 1.2, 18000);
-  }
+  // Topology registry — keyed by filterType string
+  const TOPOS = {
+    moog:  { in: moogIn,   out: moogOut  },
+    sem:   { in: semIn,    out: semOut   },
+    ms20:  { in: ms20In,   out: ms20Out  },
+    tb303: { in: tb303In,  out: tb303Out },
+  };
 
-  // Route filterInput → active topology → filterOutput
-  function connectFilter(type) {
-    // Disconnect all topology inputs from filterInput
+  // filterChain: ordered array of active filterType strings, max 2
+  let filterChain = [];
+
+  function rebuildFilterChain() {
+    // Disconnect everything between filterInput and filterOutput
     try { filterInput.disconnect(); } catch(e) {}
-    // Disconnect all topology outputs from filterOutput
-    [moogOut, semOut, ms20Out, tb303Out].forEach(o => { try { o.disconnect(filterOutput); } catch(e) {} });
-    activeFilterType = type;
-    if (type === "moog")  { filterInput.connect(moogIn);   moogOut.connect(filterOutput);  }
-    if (type === "sem")   { filterInput.connect(semIn);    semOut.connect(filterOutput);   }
-    if (type === "ms20")  { filterInput.connect(ms20In);   ms20Out.connect(filterOutput);  }
-    if (type === "tb303") { filterInput.connect(tb303In);  tb303Out.connect(filterOutput); }
-  }
-  connectFilter("moog"); // default
+    Object.values(TOPOS).forEach(t => {
+      try { t.out.disconnect(); } catch(e) {}
+    });
 
-  const initHz = 100 * Math.pow(180, p.cutoff);
-  setFilterFreqs(initHz, p.resonance);
+    if (filterChain.length === 0) {
+      // Bypass: filterInput → filterOutput directly
+      filterInput.connect(filterOutput);
+      return;
+    }
+    if (filterChain.length === 1) {
+      const t = TOPOS[filterChain[0]];
+      filterInput.connect(t.in);
+      t.out.connect(filterOutput);
+      return;
+    }
+    // Two filters in series
+    const t0 = TOPOS[filterChain[0]];
+    const t1 = TOPOS[filterChain[1]];
+    filterInput.connect(t0.in);
+    t0.out.connect(t1.in);
+    t1.out.connect(filterOutput);
+  }
+
+  // Public: add/replace filters in chain. Called from App when blocks change.
+  function setFilterChain(types) {
+    // types = [] | ["moog"] | ["moog","sem"] etc — max 2
+    filterChain = types.slice(0, 2).filter(t => TOPOS[t]);
+    rebuildFilterChain();
+  }
+
+  // Update freq/Q only on nodes that are in the active chain
+  function setFilterFreqs(hz, q) {
+    if (filterChain.includes("moog"))  { [moogStage1,moogStage2].forEach(f=>{f.frequency.value=hz;f.Q.value=q*6;}); }
+    if (filterChain.includes("sem"))   { [semLP,semNotch].forEach(f=>{f.frequency.value=hz;f.Q.value=q*8;}); }
+    if (filterChain.includes("ms20"))  { [ms20Stage1,ms20Stage2].forEach(f=>{f.frequency.value=hz;f.Q.value=q*12;}); ms20Peak.frequency.value=Math.min(hz*1.5,18000); }
+    if (filterChain.includes("tb303")) { [tb303LP,tb303BP].forEach(f=>{f.frequency.value=hz;f.Q.value=q*10;}); tb303BP.frequency.value=Math.min(hz*1.2,18000); }
+    // If no filters active yet, update all so they're ready when added
+    if (filterChain.length === 0) {
+      [moogStage1,moogStage2].forEach(f=>{f.frequency.value=hz;f.Q.value=q*6;});
+      [semLP,semNotch].forEach(f=>{f.frequency.value=hz;f.Q.value=q*8;});
+      [ms20Stage1,ms20Stage2].forEach(f=>{f.frequency.value=hz;f.Q.value=q*12;});
+      [tb303LP,tb303BP].forEach(f=>{f.frequency.value=hz;f.Q.value=q*10;});
+    }
+  }
+
+  rebuildFilterChain(); // start bypassed
 
   // ── FX chain after filterOutput ───────────────────────────────────────────
   const convolver = ctx.createConvolver();
@@ -271,38 +305,98 @@ function createEngine() {
     voice.wetL.gain.setTargetAtTime(on ? wetLevel : 0, ctx.currentTime, 0.05);
     voice.wetR.gain.setTargetAtTime(on ? wetLevel : 0, ctx.currentTime, 0.05);
   }
-  const lfo = ctx.createOscillator(); lfo.type = "sine";
-  lfo.frequency.value = p.lfoRate;
-  // Separate gain nodes per destination so we can switch cleanly
-  const lfoGain      = ctx.createGain(); lfoGain.gain.value      = 0; // pitch (cents)
-  const lfoVolGain   = ctx.createGain(); lfoVolGain.gain.value   = 0; // volume (amplitude)
-  const lfoCutGain   = ctx.createGain(); lfoCutGain.gain.value   = 0; // filter cutoff (Hz)
-  const lfoResoGain  = ctx.createGain(); lfoResoGain.gain.value  = 0; // filter Q
-  lfo.connect(lfoGain);
-  lfo.connect(lfoVolGain);  lfoVolGain.connect(masterGain.gain);
-  // cutoff and reso connected per-topology in setLfoDest
-  lfo.start();
-  let lfoDepthValue  = 0;    // stored 0-1 from DEPTH slider
-  let lfoDestination = "PITCH"; // current dest label
-  function setLfoDest(dest) {
-    lfoDestination = dest;
-    // Reset all gains to 0 first
-    [lfoGain, lfoVolGain, lfoCutGain, lfoResoGain].forEach(g => g.gain.setTargetAtTime(0, ctx.currentTime, 0.02));
-    const depth = lfoDepthValue;
-    if (dest === "PITCH")  lfoGain.gain.setTargetAtTime(depth * 80, ctx.currentTime, 0.02);
-    if (dest === "VOLUME") lfoVolGain.gain.setTargetAtTime(depth * 0.3, ctx.currentTime, 0.02);
-    if (dest === "CUTOFF") {
-      // Connect to all filter freq AudioParams
-      [moogStage1,moogStage2,semLP,semNotch,ms20Stage1,ms20Stage2,tb303LP,tb303BP]
-        .forEach(f => { try { lfoCutGain.connect(f.frequency); } catch(e){} });
-      lfoCutGain.gain.setTargetAtTime(depth * 800, ctx.currentTime, 0.02);
-    }
-    if (dest === "RESO") {
-      [moogStage1,moogStage2,semLP,ms20Stage1,ms20Stage2,tb303LP]
-        .forEach(f => { try { lfoResoGain.connect(f.Q); } catch(e){} });
-      lfoResoGain.gain.setTargetAtTime(depth * 4, ctx.currentTime, 0.02);
-    }
+  // ── LFO Factory — builds a self-contained LFO with switchable destination ──
+  function buildLfo() {
+    const osc = ctx.createOscillator(); osc.type = "sine"; osc.frequency.value = 2;
+    // Per-destination gain nodes
+    const pitchGain  = ctx.createGain(); pitchGain.gain.value  = 0;
+    const volGain    = ctx.createGain(); volGain.gain.value    = 0;
+    const cut1Gain   = ctx.createGain(); cut1Gain.gain.value   = 0;
+    const cut2Gain   = ctx.createGain(); cut2Gain.gain.value   = 0;
+    const res1Gain   = ctx.createGain(); res1Gain.gain.value   = 0;
+    const res2Gain   = ctx.createGain(); res2Gain.gain.value   = 0;
+    const delayGain  = ctx.createGain(); delayGain.gain.value  = 0;
+    const chorusGain = ctx.createGain(); chorusGain.gain.value = 0;
+    osc.connect(pitchGain);
+    osc.connect(volGain);    volGain.connect(masterGain.gain);
+    osc.connect(cut1Gain);   // connected to filter freqs in applyRoutes
+    osc.connect(cut2Gain);
+    osc.connect(res1Gain);
+    osc.connect(res2Gain);
+    osc.connect(delayGain);  delayGain.connect(delayNode.delayTime);
+    osc.connect(chorusGain); // chorus depth — connected per-voice in applyRoutes
+    osc.start();
+    return {
+      osc, pitchGain, volGain, cut1Gain, cut2Gain, res1Gain, res2Gain, delayGain, chorusGain,
+      depth: 0, dest: "PITCH", noteFreqParams: [], // populated per noteOn
+    };
   }
+
+  const lfo1 = buildLfo();
+  const lfo2 = buildLfo();
+  const LFOS = [lfo1, lfo2];
+
+  // Connect an LFO's pitchGain to a specific note's oscillator frequency params
+  function connectLfoPitch(lfoObj, freqParams) {
+    freqParams.forEach(fp => { try { lfoObj.pitchGain.connect(fp); } catch(e) {} });
+  }
+
+  // Apply a full routes array → connect correct LFO gains to correct destinations
+  // routes = [{ source:"LFO1"|"LFO2"|"ENV1"|"ENV2", dest:"PITCH"|"VOLUME"|"CUT-1"|... }, ...]
+  let currentRoutes = []; // stored so DEPTH setters can re-apply without needing React state
+  function applyRoutes(routes) {
+    currentRoutes = routes || [];
+    // Reset all modulation gains to 0
+    LFOS.forEach(l => {
+      [l.pitchGain,l.volGain,l.cut1Gain,l.cut2Gain,l.res1Gain,l.res2Gain,l.delayGain,l.chorusGain]
+        .forEach(g => g.gain.setTargetAtTime(0, ctx.currentTime, 0.02));
+    });
+    // Apply each route, reading depth from the LFO object itself
+    currentRoutes.forEach(({ source, dest }) => {
+      const lfoObj = source === "LFO1" ? lfo1 : source === "LFO2" ? lfo2 : null;
+      if (!lfoObj) return;
+      const d = lfoObj.depth ?? 0.5; // read live depth from LFO object
+      if (dest === "PITCH")   lfoObj.pitchGain.gain.setTargetAtTime(d * 80,  ctx.currentTime, 0.02);
+      if (dest === "VOLUME")  lfoObj.volGain.gain.setTargetAtTime(d * 0.3,   ctx.currentTime, 0.02);
+      if (dest === "CUT-1") {
+        const nodes = filterChain[0] ? getFilterNodes(filterChain[0]) : [];
+        nodes.forEach(f => { try { lfoObj.cut1Gain.connect(f.frequency); } catch(e){} });
+        lfoObj.cut1Gain.gain.setTargetAtTime(d * 1200, ctx.currentTime, 0.02);
+      }
+      if (dest === "CUT-2") {
+        const nodes = filterChain[1] ? getFilterNodes(filterChain[1]) : [];
+        nodes.forEach(f => { try { lfoObj.cut2Gain.connect(f.frequency); } catch(e){} });
+        lfoObj.cut2Gain.gain.setTargetAtTime(d * 1200, ctx.currentTime, 0.02);
+      }
+      if (dest === "RES-1") {
+        const nodes = filterChain[0] ? getFilterNodes(filterChain[0]) : [];
+        nodes.forEach(f => { try { lfoObj.res1Gain.connect(f.Q); } catch(e){} });
+        lfoObj.res1Gain.gain.setTargetAtTime(d * 6, ctx.currentTime, 0.02);
+      }
+      if (dest === "RES-2") {
+        const nodes = filterChain[1] ? getFilterNodes(filterChain[1]) : [];
+        nodes.forEach(f => { try { lfoObj.res2Gain.connect(f.Q); } catch(e){} });
+        lfoObj.res2Gain.gain.setTargetAtTime(d * 6, ctx.currentTime, 0.02);
+      }
+      if (dest === "DELAY")  lfoObj.delayGain.gain.setTargetAtTime(d * 0.08, ctx.currentTime, 0.02);
+      if (dest === "CHORUS") lfoObj.chorusGain.gain.setTargetAtTime(d * 0.003, ctx.currentTime, 0.02);
+    });
+  }
+
+  function getFilterNodes(type) {
+    if (type === "moog")  return [moogStage1, moogStage2];
+    if (type === "sem")   return [semLP, semNotch];
+    if (type === "ms20")  return [ms20Stage1, ms20Stage2];
+    if (type === "tb303") return [tb303LP, tb303BP];
+    return [];
+  }
+
+  // Legacy compat: keep RATE/DEPTH/SHAPE setters pointing at lfo1
+  const lfo = lfo1.osc; // alias for setters below
+  let lfoDepthValue = 0;
+  let lfoDestination = "PITCH";
+  function setLfoDest(dest) { lfoDestination = dest; } // kept for DEST block compat
+  function setLfoDestination(dest) { setLfoDest(dest); }
   // Per-oscillator mix levels for Classic Osc
   const mix = { saw: 0.5, pulse: 0.0, tri: 0.0, sub: 0.0 };
 
@@ -330,7 +424,8 @@ function createEngine() {
         o.frequency.value = freq;
         o.detune.value = (def.detuneSemis || 0) * 100 + p.detune * 100;
         g.gain.value = def.gainVal * p.drive;
-        lfoGain.connect(o.frequency);
+        lfo1.pitchGain.connect(o.frequency);
+        lfo2.pitchGain.connect(o.frequency);
         o.connect(g); g.connect(envGain);
         o.start(); 
         noteData.oscs.push({ osc: o, gainNode: g, role: def.detuneSemis ? "sub" : def.type });
@@ -340,7 +435,8 @@ function createEngine() {
       osc.type = oscType; osc.frequency.value = freq;
       osc.detune.value = p.detune * 100;
       const g = ctx.createGain(); g.gain.value = 0.4 * p.drive;
-      lfoGain.connect(osc.frequency);
+      lfo1.pitchGain.connect(osc.frequency);
+      lfo2.pitchGain.connect(osc.frequency);
       osc.connect(g); g.connect(envGain);
       osc.start();
       noteData.oscs.push({ osc, gainNode: g, role: oscType });
@@ -412,27 +508,25 @@ function createEngine() {
     SPREAD:       v => {},
     PITCH:        v => { p.detune    = (v - 0.5) * 24; },
     RATIO:        v => { p.detune    = (v - 0.5) * 24; },
-    "MOD IDX":    v => { if (lfoGain.gain.value > 0) lfoGain.gain.value = v * 80; },
+    "MOD IDX":    v => { lfo1.pitchGain.gain.setTargetAtTime(v * 80, ctx.currentTime, 0.02); },
     START:        v => {},
     END:          v => {},
     LOOP:         v => {},
-    FEEDBACK:     v => { p.delayFb   = v * 0.92; delayFbGain.gain.setTargetAtTime(p.delayFb, ctx.currentTime, 0.05); },
-    RATE:         v => { p.lfoRate   = 0.05 + v * 19.95; lfo.frequency.value = p.lfoRate; },
-    DEPTH:        v => { lfoDepthValue = v; setLfoDest(lfoDestination); },
-    DEST:         v => {
-      const dests = ["PITCH","VOLUME","CUTOFF","RESO"];
-      const dest  = dests[Math.round(v * (dests.length - 1))];
-      setLfoDest(dest);
-    },
-    SHAPE:        v => { lfo.type    = ["sine","triangle","sawtooth","square"][Math.floor(v*3.99)]; },
+    FEEDBACK:     v => { p.delayFb = v * 0.92; delayFbGain.gain.setTargetAtTime(p.delayFb, ctx.currentTime, 0.05); },
+    RATE:         v => { p.lfoRate = 0.05 + v * 19.95; lfo1.osc.frequency.value = p.lfoRate; },
+    "L2-RATE":    v => { lfo2.osc.frequency.value = 0.05 + v * 19.95; },
+    DEPTH:        v => { lfo1.depth = v; applyRoutes(currentRoutes); },
+    "L2-DEPTH":   v => { lfo2.depth = v; applyRoutes(currentRoutes); },
+    SHAPE:        v => { lfo1.osc.type = ["sine","triangle","sawtooth","square"][Math.floor(v*3.99)]; },
+    "L2-SHAPE":   v => { lfo2.osc.type = ["sine","triangle","sawtooth","square"][Math.floor(v*3.99)]; },
     PHASE:        v => {},
     SMOOTHING:    v => {},
     TIME:         v => { p.delayTime = 0.05 + v * 1.5; delayNode.delayTime.setTargetAtTime(p.delayTime, ctx.currentTime, 0.05); },
-    MOD:          v => { lfoGain.gain.value = v * 40; },
+    MOD:          v => {},
     MIX:          v => { delayMixGain.gain.setTargetAtTime(v*0.7, ctx.currentTime, 0.05); reverbGain.gain.setTargetAtTime(v*0.5, ctx.currentTime, 0.05); },
     SIZE:         v => { reverbGain.gain.setTargetAtTime(v * 0.6, ctx.currentTime, 0.05); },
-    DAMPING:      v => { /* soften reverb HF — approximate via reverbGain tilt */ reverbGain.gain.setTargetAtTime(v * 0.5, ctx.currentTime, 0.05); },
-    WIDTH:        v => { lfoGain.gain.value = v * 20; },
+    DAMPING:      v => { reverbGain.gain.setTargetAtTime(v * 0.5, ctx.currentTime, 0.05); },
+    WIDTH:        v => {},
     // ── Juno-60 Chorus ──
     "J-RATE":     v => { const hz = 0.1 + v * 1.5;  setChorusRate(juno, hz); setChorusRate(juno2, hz * 1.66); },
     "J-WIDTH":    v => { setChorusWidth(juno, v, 3.5); setChorusWidth(juno2, v, 4.0); },
@@ -449,19 +543,105 @@ function createEngine() {
     VOLUME:       v => { masterGain.gain.setTargetAtTime(0.1 + v * 0.9, ctx.currentTime, 0.02); },
   };
   function enableDelay(on) { delayMixGain.gain.setTargetAtTime(on ? 0.4 : 0, ctx.currentTime, 0.05); }
-  function enableLfo(on) {
-    lfoDepthValue = on ? 0.3 : 0;
-    setLfoDest(lfoDestination);
-  }
-  function setLfoDestination(dest) { setLfoDest(dest); }
-  function setFilterType(type) { connectFilter(type); }
   function activateChorus(type, on) {
     if (type === "juno")     { enableChorus(juno, on, 0.4); enableChorus(juno2, on, 0.3); }
     if (type === "rs09")     { enableChorus(rs09, on, 0.45); }
     if (type === "mistress") { enableChorus(mistress, on, 0.5); }
   }
   function setParam(label, val) { const fn = setters[label]; if (fn) fn(val); }
-  return { ctx, noteOn, noteOff, setParam, setFilterType, enableDelay, enableLfo, activateChorus, setLfoDestination };
+  return { ctx, noteOn, noteOff, setParam, setFilterChain, applyRoutes, enableDelay, activateChorus };
+}
+
+// ─── RouteKnob ────────────────────────────────────────────────────────────────
+// Two stepped selectors (SOURCE → DEST) rendered as a single encoder-zone widget.
+// Occupies two adjacent encoder slots.
+const ROUTE_SOURCES = ["LFO1","LFO2","ENV1","ENV2"];
+const ROUTE_DESTS   = ["PITCH","VOLUME","CUT-1","CUT-2","RES-1","RES-2","DELAY","CHORUS"];
+const ROUTE_SRC_COLORS  = { LFO1:"#9B6CC7", LFO2:"#6B7FD7", ENV1:"#C47E4A", ENV2:"#5DB88A" };
+const ROUTE_DEST_COLORS = { PITCH:"#6B7FD7", VOLUME:"#C47E4A", "CUT-1":"#5DB88A", "CUT-2":"#3D9870",
+                             "RES-1":"#9B6CC7", "RES-2":"#7A4FA8", DELAY:"#4FA8BF", CHORUS:"#3A8AA0" };
+
+function SteppedKnob({ options, value, onChange, colors, label }) {
+  const size = 36; const cx = size/2; const r = cx - 5;
+  const n = options.length;
+  const idx = Math.round(value * (n-1));
+  const opt = options[idx];
+  const color = colors[opt] || DIM;
+  const angle = -135 + (idx/(n-1))*270;
+  const rad = angle*Math.PI/180;
+  const dotX = cx + r*Math.sin(rad);
+  const dotY = cx - r*Math.cos(rad);
+  const startRef = useRef(null);
+  const [flash, setFlash] = useState(false);
+  const prevIdx = useRef(idx);
+
+  useEffect(()=>{
+    if(idx!==prevIdx.current){ prevIdx.current=idx; setFlash(true); setTimeout(()=>setFlash(false),400); }
+  },[idx]);
+
+  const snap = raw => Math.round(Math.max(0,Math.min(1,raw))*(n-1))/(n-1);
+  const onMouseDown = e => {
+    e.preventDefault(); startRef.current={y:e.clientY,value};
+    const mv = e2=>{ if(startRef.current) onChange(snap(startRef.current.value+(startRef.current.y-e2.clientY)/90)); };
+    const up = ()=>{ startRef.current=null; window.removeEventListener("mousemove",mv); window.removeEventListener("mouseup",up); };
+    window.addEventListener("mousemove",mv); window.addEventListener("mouseup",up);
+  };
+  const onTouchStart=e=>{ e.preventDefault(); startRef.current={y:e.touches[0].clientY,value}; };
+  const onTouchMove=e=>{ if(!startRef.current)return; e.preventDefault(); onChange(snap(startRef.current.value+(startRef.current.y-e.touches[0].clientY)/90)); };
+  const onWheel=e=>{ e.preventDefault(); onChange(snap(idx/(n-1)+(e.deltaY>0?-1:1)/(n-1))); };
+
+  return (
+    <div style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:3,userSelect:"none" }}>
+      <svg width={size} height={size} style={{ cursor:"ns-resize",touchAction:"none" }}
+        onMouseDown={onMouseDown} onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={()=>{startRef.current=null;}} onWheel={onWheel}>
+        <defs><radialGradient id={`rg_${label}`} cx="35%" cy="30%" r="70%"><stop offset="0%" stopColor="#3A3840"/><stop offset="100%" stopColor="#18161C"/></radialGradient></defs>
+        <circle cx={cx} cy={cx} r={cx-1} fill={`url(#rg_${label})`} stroke={color} strokeWidth="1.5" style={{filter:`drop-shadow(0 0 4px ${color}55)`,transition:"stroke 0.2s"}}/>
+        {options.map((_,i)=>{
+          const a=((-135+(i/(n-1))*270)*Math.PI/180);
+          const x1=cx+(cx-4)*Math.sin(a); const y1=cx-(cx-4)*Math.cos(a);
+          const x2=cx+(cx-8)*Math.sin(a); const y2=cx-(cx-8)*Math.cos(a);
+          return <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke={i===idx?color:DIM} strokeWidth={i===idx?2:1} style={{transition:"stroke 0.15s"}}/>;
+        })}
+        <circle cx={cx} cy={cx} r={r} fill="none" stroke="#222" strokeWidth="1.5"/>
+        <circle cx={dotX} cy={dotY} r="3" fill={color} style={{filter:`drop-shadow(0 0 3px ${color})`,transition:"fill 0.2s"}}/>
+        <circle cx={cx} cy={cx} r="4" fill={color+"33"} stroke={color} strokeWidth="1" style={{transition:"all 0.2s"}}/>
+      </svg>
+      <div style={{ background:OLED_BG, border:`1px solid ${flash?color:color+"55"}`, borderRadius:3, padding:"2px 4px", minWidth:44, textAlign:"center", boxShadow:flash?`0 0 8px ${color}88`:"none", transition:"all 0.2s" }}>
+        <div style={{ fontSize:6,color:DIM,letterSpacing:"0.1em",textTransform:"uppercase" }}>{label}</div>
+        <div style={{ fontFamily:"monospace",fontSize:9,fontWeight:700,color:flash?color:color+"CC",letterSpacing:"0.05em",transition:"color 0.2s" }}>{opt}</div>
+      </div>
+    </div>
+  );
+}
+
+function RouteKnob({ sourceVal, destVal, onSourceChange, onDestChange }) {
+  // Hold internal state so the knobs feel instant regardless of prop update latency
+  const [src, setSrc] = useState(sourceVal);
+  const [dst, setDst] = useState(destVal);
+
+  const handleSrcChange = v => { setSrc(v); onSourceChange(v); };
+  const handleDstChange = v => { setDst(v); onDestChange(v); };
+
+  const srcIdx  = Math.round(src*(ROUTE_SOURCES.length-1));
+  const dstIdx  = Math.round(dst*(ROUTE_DESTS.length-1));
+  const srcColor = ROUTE_SRC_COLORS[ROUTE_SOURCES[srcIdx]] || DIM;
+  const dstColor = ROUTE_DEST_COLORS[ROUTE_DESTS[dstIdx]]  || DIM;
+  return (
+    <div style={{ display:"flex",alignItems:"center",gap:6,padding:"4px 6px",background:PANEL_HI,border:`1px solid ${PANEL_EDGE}`,borderRadius:6 }}>
+      <SteppedKnob options={ROUTE_SOURCES} value={src} onChange={handleSrcChange} colors={ROUTE_SRC_COLORS} label="SOURCE"/>
+      <svg width={28} height={20} style={{ flexShrink:0 }}>
+        <defs>
+          <linearGradient id="arrowGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stopColor={srcColor} stopOpacity="0.8"/>
+            <stop offset="100%" stopColor={dstColor} stopOpacity="0.8"/>
+          </linearGradient>
+        </defs>
+        <line x1="2" y1="10" x2="22" y2="10" stroke="url(#arrowGrad)" strokeWidth="1.5"/>
+        <polygon points="22,6 28,10 22,14" fill={dstColor} opacity="0.8"/>
+      </svg>
+      <SteppedKnob options={ROUTE_DESTS} value={dst} onChange={handleDstChange} colors={ROUTE_DEST_COLORS} label="DEST"/>
+    </div>
+  );
 }
 
 // ─── DestKnob ─────────────────────────────────────────────────────────────────
@@ -618,8 +798,8 @@ function DestKnob({ value, onChange, color }) {
 // ─── OledLabel ────────────────────────────────────────────────────────────────
 function OledLabel({ text, color, active }) {
   return (
-    <div style={{ background:OLED_BG, border:`1px solid ${active?color:"#222"}`, borderRadius:3, padding:"2px 3px", minWidth:40, textAlign:"center", transition:"border-color 0.3s,box-shadow 0.3s", boxShadow:active?`0 0 6px ${color}77`:"none" }}>
-      <span style={{ fontFamily:"'Courier New',monospace", fontSize:8, fontWeight:700, letterSpacing:"0.05em", color:active?color:DIM, transition:"color 0.3s", display:"block", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
+    <div style={{ background:OLED_BG, border:`1px solid ${active?color:"#222"}`, borderRadius:3, padding:"2px 2px", width:44, textAlign:"center", transition:"border-color 0.3s,box-shadow 0.3s", boxShadow:active?`0 0 6px ${color}77`:"none", flexShrink:0 }}>
+      <span style={{ fontFamily:"'Courier New',monospace", fontSize:7, fontWeight:700, letterSpacing:"0.03em", color:active?color:DIM, transition:"color 0.3s", display:"block", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>
         {text || "——"}
       </span>
     </div>
@@ -649,7 +829,7 @@ function Slider({ slotId, label, color, value, assigned, highlighted, onDrop, dr
   const bc = isHov ? color : (highlighted ? color+"88" : PANEL_EDGE);
   const sh = isHov ? `0 0 10px ${color}88` : (highlighted ? `0 0 6px ${color}44` : "none");
   return (
-    <div style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:4,width:28 }}
+    <div style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:3,width:46 }}
       onDragOver={e=>{e.preventDefault();setDragOver(slotId);}}
       onDragLeave={()=>setDragOver(null)}
       onDrop={e=>{e.preventDefault();setDragOver(null);onDrop(slotId,"slider");}}>
@@ -665,22 +845,30 @@ function Slider({ slotId, label, color, value, assigned, highlighted, onDrop, dr
 }
 
 // ─── Encoder ──────────────────────────────────────────────────────────────────
-function Encoder({ slotId, label, color, value, assigned, highlighted, onDrop, dragOver, setDragOver, onChange }) {
+function Encoder({ slotId, label, color, value, destVal, assigned, highlighted, onDrop, dragOver, setDragOver, onChange }) {
   const size = 34; const cx = size/2; const r = cx-5;
   const startRef = useRef(null);
   const isHov = dragOver === `enc-${slotId}`;
 
-  // If this slot holds a DEST block, render the special knob
-  if (label === "DEST" && assigned) {
+  // ROUTE block: spans two encoder slots, rendered as RouteKnob
+  if (label === "SOURCE" && assigned) {
     return (
-      <div style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:3 }}
+      <div style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:3,gridColumn:"span 2" }}
         onDragOver={e=>{e.preventDefault();setDragOver(`enc-${slotId}`);}}
         onDragLeave={()=>setDragOver(null)}
         onDrop={e=>{e.preventDefault();setDragOver(null);onDrop(slotId,"encoder");}}>
-        <DestKnob value={value} color={color} onChange={v => onChange(slotId, v)}/>
+        <RouteKnob
+          sourceVal={value}
+          destVal={destVal ?? 0}
+          onSourceChange={v=>onChange(slotId, v)}
+          onDestChange={v=>onChange(slotId+1, v)}
+        />
       </div>
     );
   }
+  // DEST slot of a ROUTE block — hidden, rendered inside RouteKnob above
+  if (label === "DEST" && assigned) return <div style={{ display:"none" }}/>;
+
   const angle = -135 + value * 270;
   const rad   = angle * Math.PI / 180;
   const dotX  = cx + r * Math.sin(rad);
@@ -772,10 +960,16 @@ function BlockCard({ block, onDragStart, isDragging }) {
         <span style={{ fontSize:11,fontWeight:700,color:WHITE,letterSpacing:"0.02em" }}>{block.label}</span>
         <span style={{ marginLeft:"auto",fontSize:9,fontWeight:700,color,background:color+"22",padding:"1px 5px",borderRadius:3 }}>{CAT[block.cat].label}</span>
       </div>
-      <div style={{ display:"flex",gap:4,flexWrap:"wrap" }}>
+      <div style={{ display:"flex",gap:4,flexWrap:"wrap",marginBottom:4 }}>
         {block.params.slice(0,4).map(p=><span key={p} style={{ fontSize:8,color:TEXT_SEC,background:"#0006",padding:"1px 4px",borderRadius:2 }}>{p}</span>)}
       </div>
-      <div style={{ marginTop:5,fontSize:9,color:DIM,fontStyle:"italic" }}>drag to sliders or encoders →</div>
+      {block.encoderOnly && (
+        <div style={{ display:"flex",alignItems:"center",gap:4 }}>
+          <div style={{ width:8,height:8,borderRadius:"50%",background:CAT.mod.color,opacity:0.7 }}/>
+          <span style={{ fontSize:8,color:CAT.mod.color,opacity:0.8,letterSpacing:"0.06em" }}>ENCODER ONLY</span>
+        </div>
+      )}
+      {!block.encoderOnly && <div style={{ fontSize:9,color:DIM,fontStyle:"italic" }}>drag to sliders or encoders →</div>}
     </div>
   );
 }
@@ -885,49 +1079,60 @@ function EncoderZone({ encoders, previewEncoders, dragBlock, dragOver, setDragOv
   const containerRef = useRef();
   const encRefs      = useRef([]);
   const [boxRect, setBoxRect] = useState(null);
+  const rafRef = useRef(null);
   const color = dragBlock ? CAT[dragBlock.cat].color : PINK;
 
   useEffect(() => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
     if (!previewEncoders.length || !containerRef.current) { setBoxRect(null); return; }
-    const containerR = containerRef.current.getBoundingClientRect();
-    const rects = previewEncoders
-      .map(i => encRefs.current[i]?.getBoundingClientRect())
-      .filter(Boolean);
-    if (!rects.length) { setBoxRect(null); return; }
-    const pad = 6;
-    // encoders are in a 4-col grid so may wrap — use min/max across all
-    const left   = Math.min(...rects.map(r => r.left))   - containerR.left - pad;
-    const top    = Math.min(...rects.map(r => r.top))    - containerR.top  - pad;
-    const right  = Math.max(...rects.map(r => r.right))  - containerR.left + pad;
-    const bottom = Math.max(...rects.map(r => r.bottom)) - containerR.top  + pad;
-    setBoxRect({ left, top, width: right - left, height: bottom - top });
-  }, [previewEncoders]);
+    rafRef.current = requestAnimationFrame(() => {
+      if (!containerRef.current) return;
+      const containerR = containerRef.current.getBoundingClientRect();
+      const rects = previewEncoders
+        .map(i => encRefs.current[i]?.getBoundingClientRect())
+        .filter(Boolean);
+      if (!rects.length) { setBoxRect(null); return; }
+      const pad = 8;
+      const left   = Math.min(...rects.map(r => r.left))   - containerR.left - pad;
+      const top    = Math.min(...rects.map(r => r.top))    - containerR.top  - pad;
+      const right  = Math.max(...rects.map(r => r.right))  - containerR.left + pad;
+      const bottom = Math.max(...rects.map(r => r.bottom)) - containerR.top  + pad;
+      setBoxRect({ left, top, width: right - left, height: bottom - top });
+    });
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+  }, [previewEncoders.join(",")]);
+
+  // Clear box when drag ends
+  useEffect(() => { if (!dragBlock) setBoxRect(null); }, [dragBlock]);
+
+  const handleDragOver = useCallback((e, slotId) => {
+    e.preventDefault(); e.stopPropagation();
+    setDragOver(`enc-${slotId}`);
+  }, [setDragOver]);
 
   return (
-    <div ref={containerRef} style={{ position:"relative", display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:6 }}
-      onDragOver={e => e.preventDefault()}
-      onDragLeave={e => { if (!containerRef.current?.contains(e.relatedTarget)) setDragOver(null); }}
+    <div ref={containerRef}
+      style={{ position:"relative", display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:6 }}
+      onDragLeave={e => { if (!containerRef.current?.contains(e.relatedTarget)) { setDragOver(null); setBoxRect(null); } }}
+      onDrop={e => { e.preventDefault(); }}
     >
-      {boxRect && (
+      {boxRect && dragBlock && (
         <svg style={{ position:"absolute", left:0, top:0, width:"100%", height:"100%", pointerEvents:"none", overflow:"visible", zIndex:10 }}>
-          <rect
-            x={boxRect.left} y={boxRect.top}
-            width={boxRect.width} height={boxRect.height}
-            rx="6" ry="6"
-            fill={color + "18"}
-            stroke={color}
-            strokeWidth="1.5"
-            strokeDasharray="6 4"
-            style={{ animation:"march 0.4s linear infinite" }}
-          />
+          <rect x={boxRect.left} y={boxRect.top} width={boxRect.width} height={boxRect.height}
+            rx="6" ry="6" fill={color+"18"} stroke={color} strokeWidth="1.5"
+            strokeDasharray="6 4" style={{ animation:"march 0.4s linear infinite" }}/>
         </svg>
       )}
-
       {encoders.map((enc, i) => (
-        <div key={i} ref={el => encRefs.current[i] = el}>
+        <div key={i} ref={el => encRefs.current[i] = el}
+          onDragOver={e => handleDragOver(e, i)}
+          onDrop={e => { e.preventDefault(); e.stopPropagation(); setDragOver(null); setBoxRect(null); onDrop(i,"encoder"); }}
+        >
           <Encoder
             slotId={i} label={enc.assigned?enc.label:enc.defaultLabel}
-            color={enc.color||DIM} value={enc.value} assigned={enc.assigned}
+            color={enc.color||DIM} value={enc.value}
+            destVal={encoders[i+1]?.value ?? 0}
+            assigned={enc.assigned}
             highlighted={previewEncoders.includes(i)}
             onDrop={onDrop} dragOver={dragOver} setDragOver={setDragOver} onChange={onChange}
           />
@@ -951,6 +1156,10 @@ function App() {
   const [dragOver,setDragOver]   = useState(null);
   const [activeBlocks,setActiveBlocks] = useState([]);
   const [catFilter,setCatFilter] = useState("all");
+  const [latch, setLatch]   = useState(false);
+  const latchRef = useRef(false);
+  const [octave, setOctave] = useState(0); // -2 to +2
+  const latched = useRef(new Set()); // freqs held by latch
 
   const previewSlots    = dragBlock && dragOver !== null && typeof dragOver === "number"
     ? Array.from({length:dragBlock.params.length},(_,i)=>dragOver+i).filter(i=>i<16) : [];
@@ -970,29 +1179,49 @@ function App() {
   },[activeBlocks]);
 
   const noteOn = useCallback(freq=>{
-    const eng=getEngine(); eng.noteOn(freq,currentOscType());
-    setActiveFreqs(prev=>new Set([...prev,freq]));
-  },[getEngine,currentOscType]);
+    const shifted = freq * Math.pow(2, octave);
+    const eng=getEngine(); eng.noteOn(shifted, currentOscType());
+    setActiveFreqs(prev=>new Set([...prev,shifted]));
+    if (latchRef.current) latched.current.add(shifted);
+  },[getEngine,currentOscType,octave]);
 
   const noteOff = useCallback(freq=>{
+    const shifted = freq * Math.pow(2, octave);
+    if (latchRef.current) return; // held — ignore noteOff
     if(!engineRef.current)return;
-    engineRef.current.noteOff(freq);
-    setActiveFreqs(prev=>{const s=new Set(prev);s.delete(freq);return s;});
+    engineRef.current.noteOff(shifted);
+    setActiveFreqs(prev=>{const s=new Set(prev);s.delete(shifted);return s;});
+  },[octave]);
+
+  const toggleLatch = useCallback(()=>{
+    const next = !latchRef.current;
+    latchRef.current = next;
+    setLatch(next);
+    if (!next) {
+      // Release all latched notes
+      latched.current.forEach(f => {
+        if (engineRef.current) engineRef.current.noteOff(f);
+      });
+      latched.current.clear();
+      setActiveFreqs(new Set());
+    }
   },[]);
+
+  const [routes, setRoutes] = useState([]); // [{ source, dest, depth }]
 
   useEffect(()=>{
     if(!engineRef.current)return;
     const eng=engineRef.current;
-    // Switch filter topology when a filter block is loaded
-    const filterBlock = activeBlocks.find(b=>b.cat==="filter");
-    if (filterBlock?.filterType) eng.setFilterType(filterBlock.filterType);
+    // Build filter chain from all active filter blocks in order
+    const filterTypes = activeBlocks.filter(b=>b.filterType).map(b=>b.filterType);
+    eng.setFilterChain(filterTypes);
     eng.enableDelay(activeBlocks.some(b=>b.id==="delay"));
-    eng.enableLfo(activeBlocks.some(b=>b.cat==="mod"));
-    // Enable whichever chorus blocks are loaded, disable others
     ["juno","rs09","mistress"].forEach(type => {
       eng.activateChorus(type, activeBlocks.some(b=>b.chorusType===type));
     });
-  },[activeBlocks]);
+    // Rebuild routes from ROUTE blocks in encoders
+    eng.applyRoutes(routes);
+  },[activeBlocks, routes]);
 
   const handleDrop = useCallback((slotId,target)=>{
     if(!dragBlock)return;
@@ -1012,19 +1241,31 @@ function App() {
 
   const handleEncoderChange = useCallback((slotId,val)=>{
     setEncoders(prev=>{
-      const n=[...prev]; const label=n[slotId].label; n[slotId]={...n[slotId],value:val};
-      if(engineRef.current) {
-        engineRef.current.setParam(label,val);
-        // Special: DEST block also calls setLfoDestination with the string
-        if(label==="DEST") {
-          const dests=["PITCH","VOLUME","CUTOFF","RESO"];
-          const dest=dests[Math.round(val*(dests.length-1))];
-          engineRef.current.setLfoDestination(dest);
+      const n=[...prev];
+      const label=n[slotId].label;
+      n[slotId]={...n[slotId],value:val};
+      if(engineRef.current) engineRef.current.setParam(label,val);
+      // Rebuild routes from all SOURCE/DEST encoder pairs
+      const newRoutes=[];
+      for(let i=0;i<n.length-1;i++){
+        if(n[i].label==="SOURCE" && n[i].assigned && n[i+1].label==="DEST" && n[i+1].assigned){
+          const srcIdx=Math.round(n[i].value*(ROUTE_SOURCES.length-1));
+          const dstIdx=Math.round(n[i+1].value*(ROUTE_DESTS.length-1));
+          newRoutes.push({ source:ROUTE_SOURCES[srcIdx], dest:ROUTE_DESTS[dstIdx], depth:0.5 });
         }
       }
+      setRoutes(newRoutes);
+      if(engineRef.current) engineRef.current.applyRoutes(newRoutes);
       return n;
     });
   },[]);
+
+  const removeBlock = useCallback((blockId) => {
+    setActiveBlocks(prev => prev.filter(b => b.id !== blockId));
+    // Clear any slots/encoders that had this block's params
+    setSlots(prev => prev.map(s => s.blockId === blockId ? {...s, label:null, color:null, blockId:null} : s));
+    setEncoders(prev => prev.map(e => e.blockId === blockId ? {...e, label:e.defaultLabel, color:null, assigned:false, blockId:null} : e));
+  }, []);
 
   const filteredBlocks = catFilter==="all"?BLOCKS:BLOCKS.filter(b=>b.cat===catFilter);
   const cats = ["all","osc","filter","env","mod","fx"];
@@ -1032,7 +1273,17 @@ function App() {
     setSlots(Array.from({length:16},()=>({label:null,color:null,value:0.3+Math.random()*0.4})));
     setEncoders(["CUTOFF","RESONANCE","ENV AMT","LFO RATE","DRIVE","REVERB","DELAY TIME","VOLUME"].map(label=>({label,color:null,value:0.3+Math.random()*0.4,assigned:false,defaultLabel:label})));
     setActiveBlocks([]);
+    latched.current.clear(); setActiveFreqs(new Set());
   };
+
+  const btnStyle = (active, col) => ({
+    fontSize:9, fontWeight:700, letterSpacing:"0.08em", textTransform:"uppercase",
+    padding:"3px 10px", borderRadius:4, border:`1px solid ${active?(col||PINK):PANEL_EDGE}`,
+    background: active ? (col||PINK)+"22" : "none",
+    color: active ? (col||PINK) : DIM,
+    cursor:"pointer", transition:"all 0.15s",
+    boxShadow: active ? `0 0 6px ${col||PINK}44` : "none",
+  });
 
   return (
     <div style={{ fontFamily:"'Inter','Helvetica Neue',sans-serif",background:"#0D0C10",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",padding:"24px 16px 40px",gap:24 }}>
@@ -1076,18 +1327,48 @@ function App() {
             <TouchStrip/>
           </div>
 
-          {activeBlocks.length > 0 && (
-            <div style={{ background:"#0A0910",borderTop:`1px solid ${PANEL_EDGE}`,padding:"6px 14px",display:"flex",gap:6,alignItems:"center",flexWrap:"wrap" }}>
-              <span style={{ fontSize:9,color:DIM,letterSpacing:"0.1em",textTransform:"uppercase",marginRight:4 }}>CHAIN</span>
-              {activeBlocks.map((b,i)=>{const color=CAT[b.cat].color;return(
-                <span key={b.id} style={{ display:"flex",alignItems:"center",gap:4 }}>
-                  <span style={{ fontSize:9,fontWeight:700,color,background:color+"18",border:`1px solid ${color}44`,padding:"2px 8px",borderRadius:3 }}>{b.label}</span>
-                  {i<activeBlocks.length-1&&<span style={{ color:DIM,fontSize:10 }}>→</span>}
-                </span>
-              );})}
-              <button onClick={clearAll} style={{ marginLeft:"auto",fontSize:9,color:DIM,background:"none",border:`1px solid ${PANEL_EDGE}`,borderRadius:3,padding:"2px 8px",cursor:"pointer" }}>CLEAR</button>
-            </div>
-          )}
+          {/* Signal chain + controls bar */}
+          <div style={{ background:"#0A0910",borderTop:`1px solid ${PANEL_EDGE}`,padding:"6px 14px",display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",minHeight:36 }}>
+            {/* Latch */}
+            <button onClick={toggleLatch} style={btnStyle(latch, PINK)}>
+              {latch ? "⏺ LATCH ON" : "⏺ LATCH"}
+            </button>
+            {/* Octave */}
+            <button onClick={()=>setOctave(o=>Math.max(-2,o-1))} style={btnStyle(false)} disabled={octave<=-2}>OCT ▼</button>
+            <span style={{ fontSize:9, color:octave!==0?PINK:DIM, fontWeight:700, minWidth:20, textAlign:"center", letterSpacing:"0.05em" }}>
+              {octave===0?"C4":octave>0?`+${octave}`:octave}
+            </span>
+            <button onClick={()=>setOctave(o=>Math.min(2,o+1))} style={btnStyle(false)} disabled={octave>=2}>OCT ▲</button>
+
+            <div style={{ width:1, background:PANEL_EDGE, alignSelf:"stretch", margin:"0 2px" }}/>
+
+            {/* Chain label */}
+            {activeBlocks.length > 0 && <>
+              <span style={{ fontSize:9,color:DIM,letterSpacing:"0.1em",textTransform:"uppercase" }}>CHAIN</span>
+              {activeBlocks.map((b,i)=>{
+                const color=CAT[b.cat].color;
+                return (
+                  <span key={b.id} style={{ display:"flex",alignItems:"center",gap:4 }}>
+                    <span
+                      draggable
+                      onDragStart={e=>{ e.dataTransfer.setData("removeBlockId", b.id); }}
+                      onDragEnd={e=>{ if(e.dataTransfer.dropEffect==="none") removeBlock(b.id); }}
+                      title="Drag off to remove"
+                      style={{ fontSize:9,fontWeight:700,color,background:color+"18",border:`1px solid ${color}55`,padding:"2px 8px",borderRadius:3,cursor:"grab",userSelect:"none",display:"flex",alignItems:"center",gap:4 }}>
+                      {b.label}
+                      <span
+                        onClick={()=>removeBlock(b.id)}
+                        style={{ fontSize:10,color:color+"99",cursor:"pointer",lineHeight:1,padding:"0 1px" }}
+                        title="Remove">×</span>
+                    </span>
+                    {i<activeBlocks.length-1&&<span style={{ color:DIM,fontSize:10 }}>→</span>}
+                  </span>
+                );
+              })}
+            </>}
+
+            <button onClick={clearAll} style={{ ...btnStyle(false), marginLeft:"auto" }}>CLEAR ALL</button>
+          </div>
 
           <Piano onNoteOn={noteOn} onNoteOff={noteOff} activeFreqs={activeFreqs}/>
         </div>
